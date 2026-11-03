@@ -1,0 +1,8 @@
+{
+  "name": "AI Ad Studio",
+  "description": "AI-powered social video ad studio that analyzes product images with multimodal Gemini AI to generate structured product profiles, 9:16 video ads, SEO-validated captions, and scheduled social posts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
