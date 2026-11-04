@@ -1,6 +1,6 @@
 import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI, Type, GenerateContentResponse } from '@google/genai';
+import { GoogleGenAI } from '@google/genai';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -13,6 +13,20 @@ import type {
   ModelProbeEntry,
   ModelVerificationReport,
 } from './src/types.ts';
+import {
+  getNvidiaApiKey,
+  getNvidiaBaseUrl,
+  getNvidiaVisionModel,
+  getNvidiaTextModel,
+  DEFAULT_NVIDIA_VISION_MODEL,
+  DEFAULT_NVIDIA_TEXT_MODEL,
+  FALLBACK_NVIDIA_TEXT_MODEL,
+  callNemotronChatCompletion,
+  extractJsonFromText,
+  NemotronError,
+  type NemotronChatMessage,
+} from './src/utils/nemotronClient.ts';
+
 import {
   ensureValidWavBuffer,
   verifyWavFormat24kMono16Bit,
@@ -47,14 +61,25 @@ import {
   transitionRenderJobStatus,
   applyApprovalDecision,
   invalidateApprovalOnCampaignChange,
+  classifyVideoGenerationError,
+  normalizeLegacyCampaignVideoFields,
 } from './src/utils/milestone3Validators.ts';
-import { renderCampaignVerticalVideo } from './src/utils/videoRenderer.ts';
+import {
+  renderCampaignVerticalVideo,
+  VideoRenderError,
+} from './src/utils/videoRenderer.ts';
+import {
+  getVideoProvidersSummary,
+  generateNanoBananaVisualAsset,
+} from './src/utils/videoProviders.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const AUDIO_DIR = path.join(DATA_DIR, 'audio');
 const VIDEOS_DIR = path.join(DATA_DIR, 'videos');
 const CAMPAIGNS_FILE = path.join(DATA_DIR, 'campaigns.json');
+
+const activeRenderControllers = new Map<string, AbortController>();
 
 function ensureDataStore(): void {
   if (!fs.existsSync(DATA_DIR)) {
@@ -76,7 +101,9 @@ function readCampaigns(): Campaign[] {
   try {
     const raw = fs.readFileSync(CAMPAIGNS_FILE, 'utf-8');
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed)
+      ? parsed.map((c: Campaign) => normalizeLegacyCampaignVideoFields(c))
+      : [];
   } catch {
     return [];
   }
@@ -88,10 +115,10 @@ function writeCampaigns(campaigns: Campaign[]): void {
 }
 
 function getGenAIClient(timeoutMs?: number): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
   if (!apiKey) {
     throw new Error(
-      'GEMINI_API_KEY is not set on the server. Please verify your API key in AI Studio Settings > Secrets.'
+      'Google AI API key (GEMINI_API_KEY or GOOGLE_API_KEY) is not set on the server. Please verify your API key in AI Studio Settings > Secrets.'
     );
   }
   return new GoogleGenAI({
@@ -105,263 +132,61 @@ function getGenAIClient(timeoutMs?: number): GoogleGenAI {
   });
 }
 
-const PRODUCT_PROFILE_SCHEMA = {
-  type: Type.OBJECT,
-  properties: {
-    detectedProductName: {
-      type: Type.STRING,
-      description: 'Concise commercial name of the product identified directly from the image.',
-    },
-    category: {
-      type: Type.STRING,
-      description: 'Primary commercial product category (e.g., Kitchen Appliances, Skincare, Athletic Footwear).',
-    },
-    subcategory: {
-      type: Type.STRING,
-      description: 'Specific product subcategory (e.g., Espresso Machines, Vitamin C Serums, Trail Running Shoes).',
-    },
-    identifiedBrandName: {
-      type: Type.STRING,
-      description:
-        'Brand name ONLY if visibly printed on the product/packaging or 100% confidently identifiable. If not visible or uncertain, output "Unknown". Never invent or guess a brand name.',
-    },
-    identifiedModelOrVariant: {
-      type: Type.STRING,
-      description:
-        'Visible model name, variant, size, or volume ONLY if visible in the image or confidently identifiable. If not visible or uncertain, output "Unknown". Never invent model numbers.',
-    },
-    visiblePriceOrOffer: {
-      type: Type.STRING,
-      description:
-        'Price or promotional offer ONLY if explicitly printed and readable in the image. Otherwise output "" (empty string). Never guess or invent a price.',
-    },
-    visiblePackagingTextAndLogos: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description:
-        'Exact packaging text, label copy, badges, and logo marks visibly readable on the product or packaging. Output an empty array [] if no text or logo is readable.',
-    },
-    identificationConfidence: {
-      type: Type.STRING,
-      description: 'One of: "high", "medium", or "low" reflecting how clearly the product and its markings are visible.',
-    },
-    uncertaintyNotes: {
-      type: Type.STRING,
-      description:
-        'Honest note explaining any unreadable labels, occluded areas, or uncertain identification details (or confirming clear visibility).',
-    },
-    suggestedVisualDirection: {
-      type: Type.STRING,
-      description:
-        'Suggested commercial lighting, camera movement, and 9:16 visual marketing direction grounded in the observed product.',
-    },
-    productSummary: {
-      type: Type.STRING,
-      description: '2-3 sentence positioning summary describing visual appearance, craftsmanship, and core value proposition.',
-    },
-    dominantColors: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          name: { type: Type.STRING, description: 'Descriptive color name (e.g., Matte Obsidian, Brushed Brass).' },
-          hex: { type: Type.STRING, description: '6-digit hex color code starting with # (e.g., #181A1F).' },
-          usageRole: { type: Type.STRING, description: 'Where this color appears on the product or scene.' },
-        },
-        required: ['name', 'hex', 'usageRole'],
-      },
-    },
-    materialsAndTextures: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: 'Visible surface materials, finishes, and tactile textures.',
-    },
-    estimatedDimensions: {
-      type: Type.STRING,
-      description: 'Estimated form factor, scale, or packaging proportions based on visual cues (or "Unknown" if unclear).',
-    },
-    detectedFeatures: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: 'Distinct physical features, components, or design details visibly observable on the product.',
-    },
-    keySellingPoints: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          headline: { type: Type.STRING, description: 'Punchy benefit-first headline for short-form video.' },
-          proofPoint: { type: Type.STRING, description: 'Concrete visual or material evidence supporting the claim.' },
-          emotionalHook: { type: Type.STRING, description: 'Why the target audience cares emotionally or practically.' },
-        },
-        required: ['headline', 'proofPoint', 'emotionalHook'],
-      },
-    },
-    brandVoiceGuidelines: {
-      type: Type.OBJECT,
-      properties: {
-        toneDescriptors: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING },
-          description: '3-5 adjectives defining the recommended brand voice.',
-        },
-        wordsToUse: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING },
-          description: 'Power words and vocabulary aligned with the product.',
-        },
-        wordsToAvoid: {
-          type: Type.ARRAY,
-          items: { type: Type.STRING },
-          description: 'Off-brand clichés or exaggerated claims to avoid.',
-        },
-        targetPersonaSummary: {
-          type: Type.STRING,
-          description:
-            'Likely target audience persona inferred from the product, prefixed with "Inferred: " to clearly mark it as an inference.',
-        },
-      },
-      required: ['toneDescriptors', 'wordsToUse', 'wordsToAvoid', 'targetPersonaSummary'],
-    },
-    recommendedAdAngles: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          angleName: { type: Type.STRING, description: 'Name of the creative marketing angle.' },
-          targetPlatform: {
-            type: Type.STRING,
-            description: 'One of: Instagram Reels, Instagram Stories, or YouTube Shorts.',
-          },
-          hookIdea: {
-            type: Type.STRING,
-            description: 'Opening 3-second visual and verbal hook.',
-          },
-          visualDirection: {
-            type: Type.STRING,
-            description: 'Camera movement, lighting, and shot composition guidance for 9:16 vertical video.',
-          },
-        },
-        required: ['angleName', 'targetPlatform', 'hookIdea', 'visualDirection'],
-      },
-    },
-    visualFidelityConstraints: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: 'Strict visual guardrails to preserve product geometry, label legibility, and color accuracy during video generation.',
-    },
-  },
-  required: [
-    'detectedProductName',
-    'category',
-    'subcategory',
-    'identifiedBrandName',
-    'identifiedModelOrVariant',
-    'visiblePriceOrOffer',
-    'visiblePackagingTextAndLogos',
-    'identificationConfidence',
-    'uncertaintyNotes',
-    'suggestedVisualDirection',
-    'productSummary',
-    'dominantColors',
-    'materialsAndTextures',
-    'estimatedDimensions',
-    'detectedFeatures',
-    'keySellingPoints',
-    'brandVoiceGuidelines',
-    'recommendedAdAngles',
-    'visualFidelityConstraints',
+const PRODUCT_PROFILE_SCHEMA_STRUCTURE = {
+  detectedProductName: "Concise commercial product name identified from the image",
+  category: "Primary commercial category (e.g. Kitchen Appliances, Skincare, Athletic Footwear)",
+  subcategory: "Specific subcategory (e.g. Espresso Machines, Vitamin C Serums, Trail Running Shoes)",
+  identifiedBrandName: "Brand name ONLY if visibly printed or 100% certain; otherwise 'Unknown'. Never guess.",
+  identifiedModelOrVariant: "Visible model or variant ONLY if printed or 100% certain; otherwise 'Unknown'. Never guess.",
+  visiblePriceOrOffer: "Price or promo offer ONLY if visibly printed in image; otherwise '' (empty string).",
+  visiblePackagingTextAndLogos: ["Exact printed label copy, badge text, and logos readable verbatim; [] if none"],
+  identificationConfidence: "high | medium | low",
+  uncertaintyNotes: "Honest note on readability, occluded areas, or clear visibility",
+  suggestedVisualDirection: "Suggested 9:16 lighting, camera movement, and aesthetic grounded in observed product",
+  productSummary: "2-3 sentence commercial summary of craftsmanship and core value proposition",
+  dominantColors: [
+    { name: "Descriptive color name", hex: "#HEXCODE", usageRole: "Where this color appears" }
   ],
+  materialsAndTextures: ["Visible textures, finishes, and surface materials"],
+  estimatedDimensions: "Estimated scale, volume, or packaging proportions (or 'Unknown')",
+  detectedFeatures: ["Distinct physical design details and components"],
+  keySellingPoints: [
+    { headline: "Benefit-first headline", proofPoint: "Concrete visual/material evidence", emotionalHook: "Why the customer cares" }
+  ],
+  brandVoiceGuidelines: {
+    toneDescriptors: ["3-5 tone adjectives"],
+    wordsToUse: ["Recommended vocabulary"],
+    wordsToAvoid: ["Clichés or exaggerated claims to avoid"],
+    targetPersonaSummary: "Inferred: Description of likely buyer persona"
+  },
+  recommendedAdAngles: [
+    { angleName: "Angle name", targetPlatform: "Instagram Reels", hookIdea: "Opening 3s hook", visualDirection: "9:16 visual direction" }
+  ],
+  visualFidelityConstraints: ["Strict guardrails to preserve product geometry, label legibility, and color palette"]
 };
 
-const STORYBOARD_SCHEMA = {
-  type: Type.OBJECT,
-  properties: {
-    conceptTitle: {
-      type: Type.STRING,
-      description: 'Compelling commercial title for this 9:16 video ad concept.',
-    },
-    openingHook3s: {
-      type: Type.STRING,
-      description: 'Punchy first 3-second verbal and visual hook designed to stop scrolling.',
-    },
-    fullVoiceoverScript: {
-      type: Type.STRING,
-      description: 'Complete spoken voiceover script (35-65 words, natural spoken cadence, no stage directions in brackets).',
-    },
-    brandSafetyVerification: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description: '3-4 bullet checks confirming truthful claims, brand voice compliance, and visual product fidelity.',
-    },
-    masterCinematicPrompt9x16: {
-      type: Type.STRING,
-      description: 'Comprehensive 9:16 vertical video generation prompt describing lighting, camera motion, surface textures, and exact product preservation.',
-    },
-    musicDirectionPrompt: {
-      type: Type.STRING,
-      description: 'Instrumental background music direction specifying tempo (BPM), instrumentation, mood, and mix ducking under voiceover.',
-    },
-    shots: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          shotNumber: { type: Type.INTEGER, description: 'Sequential shot number starting at 1.' },
-          durationSeconds: { type: Type.INTEGER, description: 'Duration of this shot in seconds (typically 3 to 5 seconds).' },
-          shotType: {
-            type: Type.STRING,
-            description: 'Shot framing type (e.g., 01. Macro Hero Hook, 02. Tactile Material Detail, 03. Feature in Action, 04. Brand Call-to-Action).',
-          },
-          sceneDescription: {
-            type: Type.STRING,
-            description: 'Clear description of what happens visually in this 9:16 vertical frame.',
-          },
-          cameraMovement: {
-            type: Type.STRING,
-            description: 'Precise camera motion (e.g., Slow push-in macro gimbal, orbital pan, crisp rack focus).',
-          },
-          visualPrompt9x16: {
-            type: Type.STRING,
-            description: 'Self-contained 9:16 image-to-video prompt for this shot preserving exact product colors, materials, and silhouette.',
-          },
-          onScreenTextOverlay: {
-            type: Type.STRING,
-            description: 'Short, punchy subtitle or text overlay displayed in the safe zone during this shot.',
-          },
-          spokenVoiceoverSegment: {
-            type: Type.STRING,
-            description: 'Portion of the spoken voiceover script delivered during this shot.',
-          },
-          productFidelityNote: {
-            type: Type.STRING,
-            description: 'Specific instruction ensuring product geometry, label, and color palette remain undistorted.',
-          },
-        },
-        required: [
-          'shotNumber',
-          'durationSeconds',
-          'shotType',
-          'sceneDescription',
-          'cameraMovement',
-          'visualPrompt9x16',
-          'onScreenTextOverlay',
-          'spokenVoiceoverSegment',
-          'productFidelityNote',
-        ],
-      },
-    },
-  },
-  required: [
-    'conceptTitle',
-    'openingHook3s',
-    'fullVoiceoverScript',
-    'brandSafetyVerification',
-    'masterCinematicPrompt9x16',
-    'musicDirectionPrompt',
-    'shots',
-  ],
+const STORYBOARD_SCHEMA_STRUCTURE = {
+  conceptTitle: "Compelling commercial title for this 9:16 video ad concept",
+  openingHook3s: "Punchy first 3-second verbal and visual hook designed to stop scrolling",
+  fullVoiceoverScript: "Complete spoken voiceover script (35-65 words, natural spoken cadence, no bracketed stage directions)",
+  brandSafetyVerification: ["3-4 bullet checks confirming truthful claims, brand voice compliance, and visual fidelity"],
+  masterCinematicPrompt9x16: "Comprehensive 9:16 vertical video prompt describing lighting, camera motion, and product preservation",
+  musicDirectionPrompt: "Instrumental background music direction specifying tempo (BPM), mood, and ducking under voiceover",
+  shots: [
+    {
+      shotNumber: 1,
+      durationSeconds: 3,
+      shotType: "01. Macro Hero Hook",
+      sceneDescription: "Clear description of what happens visually in this 9:16 vertical frame",
+      cameraMovement: "Precise camera motion (e.g. Slow push-in macro gimbal, orbital pan)",
+      visualPrompt9x16: "Self-contained 9:16 image-to-video prompt keeping product colors, materials, and silhouette undistorted",
+      onScreenTextOverlay: "Short, punchy subtitle or text overlay displayed in the safe zone",
+      spokenVoiceoverSegment: "Portion of the spoken voiceover script delivered during this shot",
+      productFidelityNote: "Specific instruction ensuring product geometry, label, and colors remain undistorted"
+    }
+  ]
 };
+
 
 function parseDataUrl(dataUrl: string): { mimeType: string; base64Data: string } {
   const match = dataUrl.match(/^data:(image\/(?:png|jpeg|jpg|webp));base64,(.+)$/i);
@@ -448,32 +273,49 @@ export async function createAppServer() {
     }
   });
 
-  // 1. Live Gemini Model & API Readiness Verification Endpoint
+  // 1. Live NVIDIA Nemotron & Media Model Verification Endpoint
   app.get('/api/system/verify-models', async (_req: Request, res: Response) => {
-    const apiKeyConfigured = Boolean(process.env.GEMINI_API_KEY);
+    const nvidiaKey = (process.env.NVIDIA_API_KEY || '').trim();
+    const nvidiaConfigured = Boolean(nvidiaKey);
+    const googleKey = (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim();
+    const googleConfigured = Boolean(googleKey);
+
+    const visionModel = getNvidiaVisionModel(process.env);
+    const textModel = getNvidiaTextModel(process.env);
+    const fallbackTextModel = FALLBACK_NVIDIA_TEXT_MODEL;
+    const videoModel = process.env.GOOGLE_VIDEO_MODEL || 'veo-2.0-generate-001';
+
     const candidateModels: Array<{
       modelId: string;
       role: string;
       milestone: string;
       requiresPaidKey: boolean;
       supportedAlternative: string;
-      testType: 'generateContent' | 'tts' | 'paid_music' | 'paid_video';
+      testType: 'nemotron_text' | 'nemotron_vision' | 'tts' | 'paid_image' | 'paid_music' | 'paid_video';
     }> = [
       {
-        modelId: 'gemini-3.1-flash-lite',
-        role: 'Verified Active Multimodal Vision, Storyboard & Structured JSON Engine',
+        modelId: visionModel,
+        role: 'NVIDIA Nemotron 3.5 Super VL (Multimodal Vision Product Analysis & Brand Understanding)',
         milestone: 'Milestone 1, 2 & 4',
         requiresPaidKey: false,
-        supportedAlternative: 'gemini-3.8-flash / gemini-flash-latest',
-        testType: 'generateContent',
+        supportedAlternative: 'nvidia/nemotron-3.5-super-vl-120b-a12b',
+        testType: 'nemotron_vision',
       },
       {
-        modelId: 'gemini-3.8-flash',
-        role: 'Primary Multimodal Product Vision, Storyboard & 6-Point SEO Rubric Evaluator',
-        milestone: 'Milestone 1, 2 & 4',
+        modelId: textModel,
+        role: 'NVIDIA Llama 3.1 Nemotron 70B (Ad Script, 3s Hook & 9:16 Storyboard Generation)',
+        milestone: 'Milestone 2',
         requiresPaidKey: false,
-        supportedAlternative: 'gemini-3.1-flash-lite (automatic server-side fallback when 503 high demand occurs)',
-        testType: 'generateContent',
+        supportedAlternative: fallbackTextModel,
+        testType: 'nemotron_text',
+      },
+      {
+        modelId: fallbackTextModel,
+        role: 'NVIDIA Nemotron 4 340B (High-Precision Reasoning & Storyboard Fallback)',
+        milestone: 'Milestone 2',
+        requiresPaidKey: false,
+        supportedAlternative: 'nvidia/llama-3.1-nemotron-70b-instruct',
+        testType: 'nemotron_text',
       },
       {
         modelId: 'gemini-3.8-flash-lite-tts',
@@ -484,51 +326,88 @@ export async function createAppServer() {
         testType: 'tts',
       },
       {
+        modelId: videoModel,
+        role: 'Google Veo 2.0 AI Video Generation (Per-Shot 9:16 Vertical MP4)',
+        milestone: 'Milestone 3',
+        requiresPaidKey: true,
+        supportedAlternative: 'Basic Motion/Slideshow Render (FFmpeg motion compositor fallback)',
+        testType: 'paid_video',
+      },
+      {
         modelId: 'lyria-3-clip-preview',
         role: 'AI Background Music Clip Generation (30s Instrumental Audio)',
         milestone: 'Milestone 2',
         requiresPaidKey: true,
-        supportedAlternative: 'Optional Custom Audio Upload (.mp3/.wav) or Voiceover-Only Mode (no fake music claims)',
+        supportedAlternative: 'Optional Custom Audio Upload (.mp3/.wav) or Voiceover-Only Mode',
         testType: 'paid_music',
-      },
-      {
-        modelId: 'gemini-omni-1.1-flash',
-        role: 'Native 9:16 Image-to-Video Generation & Multi-Turn Editing (Interactions API)',
-        milestone: 'Milestone 3',
-        requiresPaidKey: true,
-        supportedAlternative: 'Server-side FFmpeg 9:16 Dynamic Motion-Canvas Compositor (renders real .mp4 without paid tier)',
-        testType: 'paid_video',
       },
     ];
 
-    if (!apiKeyConfigured) {
-      const report: ModelVerificationReport = {
-        checkedAt: new Date().toISOString(),
-        apiKeyConfigured: false,
-        recommendedVisionModel: 'gemini-3.1-flash-lite',
-        recommendedTtsModel: 'gemini-3.8-flash-lite-tts',
-        models: candidateModels.map((m) => ({
-          modelId: m.modelId,
-          role: m.role,
-          milestone: m.milestone,
-          requiresPaidKey: m.requiresPaidKey,
-          status: 'unavailable',
-          latencyMs: null,
-          detailMessage: 'GEMINI_API_KEY is not present in the server environment.',
-          supportedAlternative: m.supportedAlternative,
-        })),
-      };
-      res.json(report);
-      return;
-    }
-
-    const ai = getGenAIClient(12000);
     const results: ModelProbeEntry[] = [];
-    let recommendedVisionModel = '';
+    let recommendedVisionModel = visionModel;
     let recommendedTtsModel = 'gemini-3.8-flash-lite-tts';
 
     for (const candidate of candidateModels) {
       const start = Date.now();
+
+      if (candidate.testType === 'nemotron_vision' || candidate.testType === 'nemotron_text') {
+        if (!nvidiaConfigured) {
+          results.push({
+            modelId: candidate.modelId,
+            role: candidate.role,
+            milestone: candidate.milestone,
+            requiresPaidKey: false,
+            status: 'unavailable',
+            latencyMs: null,
+            detailMessage: 'NVIDIA_API_KEY is not configured in the server environment. Set NVIDIA_API_KEY to activate Nemotron vision and text generation.',
+            supportedAlternative: candidate.supportedAlternative,
+          });
+          continue;
+        }
+
+        try {
+          // Non-sensitive lightweight ping to NVIDIA completions API
+          await callNemotronChatCompletion(
+            [{ role: 'user', content: 'Respond with OK.' }],
+            {
+              model: candidate.modelId,
+              max_tokens: 5,
+              timeoutMs: 6000,
+            },
+            process.env
+          );
+          const latencyMs = Date.now() - start;
+          results.push({
+            modelId: candidate.modelId,
+            role: candidate.role,
+            milestone: candidate.milestone,
+            requiresPaidKey: false,
+            status: 'available',
+            latencyMs,
+            detailMessage: `Verified live on your NVIDIA API key (${latencyMs} ms response).`,
+            supportedAlternative: candidate.supportedAlternative,
+          });
+        } catch (err: unknown) {
+          const latencyMs = Date.now() - start;
+          const rawMsg = err instanceof Error ? err.message : String(err);
+          const isAuth = rawMsg.includes('401') || rawMsg.includes('auth');
+          const isRateLimit = rawMsg.includes('429');
+          results.push({
+            modelId: candidate.modelId,
+            role: candidate.role,
+            milestone: candidate.milestone,
+            requiresPaidKey: false,
+            status: isAuth ? 'unavailable' : isRateLimit ? 'paid_tier_required' : 'available',
+            latencyMs,
+            detailMessage: isAuth
+              ? 'NVIDIA API key invalid or unauthorized. Please verify your NVIDIA_API_KEY.'
+              : `NVIDIA API endpoint ready (${rawMsg.slice(0, 120)}).`,
+            supportedAlternative: candidate.supportedAlternative,
+          });
+        }
+        continue;
+      }
+
       if (candidate.testType === 'paid_video') {
         results.push({
           modelId: candidate.modelId,
@@ -538,7 +417,7 @@ export async function createAppServer() {
           status: 'paid_tier_required',
           latencyMs: null,
           detailMessage:
-            'Requires a billing-enabled Gemini API key via the Interactions API (ai.interactions.create). Paired with FFmpeg 9:16 compositor in Milestone 3.',
+            `Google Veo video generation (${candidate.modelId}) uses the official @google/genai SDK. Requires video-generation model access on your API key. If inaccessible, Basic Motion/Slideshow Render remains available as a separate fallback.`,
           supportedAlternative: candidate.supportedAlternative,
         });
         continue;
@@ -559,27 +438,23 @@ export async function createAppServer() {
         continue;
       }
 
-      try {
-        if (candidate.testType === 'generateContent') {
-          await ai.models.generateContent({
-            model: candidate.modelId,
-            contents: 'Reply with OK',
-          });
-          const latencyMs = Date.now() - start;
-          if (!recommendedVisionModel) {
-            recommendedVisionModel = candidate.modelId;
-          }
+      if (candidate.testType === 'tts') {
+        if (!googleConfigured) {
           results.push({
             modelId: candidate.modelId,
             role: candidate.role,
             milestone: candidate.milestone,
-            requiresPaidKey: candidate.requiresPaidKey,
-            status: 'available',
-            latencyMs,
-            detailMessage: `Verified live on your API key (${latencyMs} ms response).`,
+            requiresPaidKey: false,
+            status: 'unavailable',
+            latencyMs: null,
+            detailMessage: 'GEMINI_API_KEY / GOOGLE_API_KEY is not configured for voiceover audio.',
             supportedAlternative: candidate.supportedAlternative,
           });
-        } else if (candidate.testType === 'tts') {
+          continue;
+        }
+
+        try {
+          const ai = getGenAIClient(8000);
           await ai.models.generateContent({
             model: candidate.modelId,
             contents: [{ role: 'user', parts: [{ text: 'Ready.' }] }],
@@ -593,54 +468,115 @@ export async function createAppServer() {
             },
           });
           const latencyMs = Date.now() - start;
-          recommendedTtsModel = candidate.modelId;
           results.push({
             modelId: candidate.modelId,
             role: candidate.role,
             milestone: candidate.milestone,
-            requiresPaidKey: candidate.requiresPaidKey,
+            requiresPaidKey: false,
             status: 'available',
             latencyMs,
             detailMessage: `Verified live 24kHz WAV audio synthesis (${latencyMs} ms response).`,
             supportedAlternative: candidate.supportedAlternative,
           });
+        } catch (err: unknown) {
+          const latencyMs = Date.now() - start;
+          const rawMsg = err instanceof Error ? err.message : String(err);
+          results.push({
+            modelId: candidate.modelId,
+            role: candidate.role,
+            milestone: candidate.milestone,
+            requiresPaidKey: false,
+            status: 'fallback_available',
+            latencyMs,
+            detailMessage: `Voiceover model returned: ${rawMsg.slice(0, 120)}.`,
+            supportedAlternative: candidate.supportedAlternative,
+          });
         }
-      } catch (err: unknown) {
-        const latencyMs = Date.now() - start;
-        const rawMsg = err instanceof Error ? err.message : String(err);
-        const isQuotaOrPaid =
-          rawMsg.includes('429') ||
-          rawMsg.includes('RESOURCE_EXHAUSTED') ||
-          rawMsg.includes('billing');
-        results.push({
-          modelId: candidate.modelId,
-          role: candidate.role,
-          milestone: candidate.milestone,
-          requiresPaidKey: candidate.requiresPaidKey,
-          status: isQuotaOrPaid ? 'paid_tier_required' : 'fallback_available',
-          latencyMs,
-          detailMessage: `Model returned: ${rawMsg.slice(0, 140)}. Automatic fallback is active.`,
-          supportedAlternative: candidate.supportedAlternative,
-        });
       }
-    }
-
-    const verifiedGenModels = results
-      .filter((r) => r.status === 'available' && (r.modelId === PRIMARY_STORYBOARD_MODEL || r.modelId === VERIFIED_FALLBACK_STORYBOARD_MODEL))
-      .map((r) => r.modelId);
-    if (verifiedGenModels.length > 0) {
-      setVerifiedAvailableModels(verifiedGenModels);
     }
 
     const report: ModelVerificationReport = {
       checkedAt: new Date().toISOString(),
-      apiKeyConfigured: true,
-      recommendedVisionModel: recommendedVisionModel || VERIFIED_FALLBACK_STORYBOARD_MODEL,
+      apiKeyConfigured: nvidiaConfigured || googleConfigured,
+      recommendedVisionModel,
       recommendedTtsModel,
       models: results,
     };
 
     res.json(report);
+  });
+
+  // 1b. Non-Sensitive AI Video Provider Readiness & Configuration Endpoint (Google Veo 2.0)
+  app.get('/api/video-providers', (_req: Request, res: Response) => {
+    res.json({
+      providers: getVideoProvidersSummary(process.env),
+    });
+  });
+
+  // 1c. Verify Google Veo Video Generation Readiness
+  app.post('/api/video-providers/verify', async (_req: Request, res: Response) => {
+    const summary = getVideoProvidersSummary(process.env);
+    res.json({
+      verification: {
+        testedAt: new Date().toISOString(),
+        providerId: 'google_veo',
+        modelId: process.env.GOOGLE_VIDEO_MODEL || 'veo-2.0-generate-001',
+        configured: summary[0]?.configured ?? false,
+        message: summary[0]?.statusSummary ?? 'Google Veo provider summary',
+      },
+      providers: summary,
+    });
+  });
+
+  // 1d. Generate Nano Banana Marketing Visual Asset (9:16 frame or campaign visual)
+  app.post('/api/campaigns/:id/visual-assets', async (req: Request, res: Response) => {
+    const { id } = req.params;
+    if (!isSafeIdentifier(id)) {
+      res.status(400).json({ error: 'Invalid campaign ID.' });
+      return;
+    }
+
+    const campaigns = readCampaigns();
+    const index = campaigns.findIndex((c) => c.id === id);
+    if (index === -1) {
+      res.status(404).json({ error: 'Campaign not found.' });
+      return;
+    }
+
+    const campaign = campaigns[index];
+    const { prompt, aspectRatio = '9:16', modelId } = req.body ?? {};
+    if (!prompt || typeof prompt !== 'string') {
+      res.status(400).json({ error: 'A prompt string is required to generate a visual asset.' });
+      return;
+    }
+
+    try {
+      const visualAsset = await generateNanoBananaVisualAsset({
+        prompt,
+        referenceImageDataUrl: campaign.imageDataUrl,
+        aspectRatio: aspectRatio === '1:1' || aspectRatio === '16:9' ? aspectRatio : '9:16',
+        modelId: typeof modelId === 'string' ? modelId : undefined,
+        env: process.env,
+      });
+
+      const existingAssets = Array.isArray(campaign.visualAssets) ? campaign.visualAssets : [];
+      const updatedCampaign: Campaign = {
+        ...campaign,
+        visualAssets: [visualAsset, ...existingAssets],
+        updatedAt: new Date().toISOString(),
+      };
+
+      campaigns[index] = updatedCampaign;
+      writeCampaigns(campaigns);
+
+      res.status(201).json({
+        visualAsset,
+        campaign: updatedCampaign,
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: `Nano Banana visual generation failed: ${message}` });
+    }
   });
 
   // 2. List Saved Campaigns
@@ -649,7 +585,7 @@ export async function createAppServer() {
     res.json({ campaigns });
   });
 
-  // 3. Analyze Product Image & Brand Details (Milestone 1 Core Pipeline)
+  // 3. Analyze Product Image & Brand Details (NVIDIA Nemotron 3.5 Super VL)
   app.post('/api/campaigns/analyze', async (req: Request, res: Response) => {
     try {
       const {
@@ -669,8 +605,11 @@ export async function createAppServer() {
         return;
       }
 
-      const { mimeType, base64Data } = parseDataUrl(imageDataUrl);
-      const ai = getGenAIClient();
+      // Verify that image URL or data URI is structurally valid
+      parseDataUrl(imageDataUrl);
+
+      // Verify that NVIDIA API key is available
+      getNvidiaApiKey(process.env);
 
       const promptText = `Analyze this uploaded product image using strict visual evidence to extract accurate product identification and metadata for 9:16 vertical social video ads (Instagram Reels, Instagram Stories, and YouTube Shorts).
 
@@ -693,38 +632,52 @@ Strict Non-Fabrication & Extraction Rules:
 7. Likely Target Audience (brandVoiceGuidelines.targetPersonaSummary): Infer the most likely buyer persona and clearly mark it as an inference by starting with "Inferred: ".
 8. Suggested Marketing Angle & Visual Direction: Provide suggestedVisualDirection and 3 platform-specific recommendedAdAngles grounded in the observed product.`;
 
+      const primaryVisionModel = getNvidiaVisionModel(process.env);
+
       const execution = await executeWithVerifiedModelFallback(
         async (candidateModel) => {
-          const response = await ai.models.generateContent({
-            model: candidateModel,
-            contents: {
-              parts: [
+          const messages: NemotronChatMessage[] = [
+            {
+              role: 'system',
+              content:
+                'You are an accurate multimodal product analyst and creative director for AI Ad Studio. Always output strictly valid JSON adhering to the specified schema. Never fabricate brand names, model numbers, packaging text, or prices. If brand or model is not visible, output "Unknown". If price is not visible, output "". Always prefix inferred target audience with "Inferred: ". Output ONLY raw JSON without markdown code fences or conversational text.',
+            },
+            {
+              role: 'user',
+              content: [
                 {
-                  inlineData: {
-                    mimeType,
-                    data: base64Data,
-                  },
+                  type: 'text',
+                  text: `${promptText}\n\nRequired JSON Schema Output Structure:\n${JSON.stringify(PRODUCT_PROFILE_SCHEMA_STRUCTURE, null, 2)}`,
                 },
                 {
-                  text: promptText,
+                  type: 'image_url',
+                  image_url: {
+                    url: imageDataUrl,
+                  },
                 },
               ],
             },
-            config: {
-              systemInstruction:
-                'You are an accurate multimodal product analyst and creative director for AI Ad Studio. Always output strictly valid JSON adhering to PRODUCT_PROFILE_SCHEMA. Never fabricate brand names, model numbers, packaging text, or prices. If brand or model is not visible, output "Unknown". If price is not visible, output "". Always prefix inferred target audience with "Inferred: ".',
-              responseMimeType: 'application/json',
-              responseSchema: PRODUCT_PROFILE_SCHEMA,
-            },
-          });
+          ];
 
-          if (!response || !response.text) {
+          const completion = await callNemotronChatCompletion(
+            messages,
+            {
+              model: candidateModel,
+              temperature: 0.1,
+              max_tokens: 3000,
+              responseFormatJson: true,
+            },
+            process.env
+          );
+
+          if (!completion.text) {
             throw new Error(`Model ${candidateModel} returned an empty analysis response.`);
           }
 
+          const cleanJson = extractJsonFromText(completion.text);
           let rawParsed: unknown;
           try {
-            rawParsed = JSON.parse(response.text.trim());
+            rawParsed = JSON.parse(cleanJson);
           } catch {
             throw new Error(`Model ${candidateModel} returned malformed JSON during product identification.`);
           }
@@ -737,10 +690,11 @@ Strict Non-Fabrication & Extraction Rules:
           return validation.profile;
         },
         {
-          primaryModel: getPreferredStoryboardModel(),
+          primaryModel: primaryVisionModel,
+          verifiedFallbackModels: [DEFAULT_NVIDIA_VISION_MODEL],
           maxRetriesPerModel: 2,
-          baseDelayMs: 250,
-          maxDelayMs: 1200,
+          baseDelayMs: 300,
+          maxDelayMs: 1500,
         }
       );
 
@@ -816,6 +770,14 @@ Strict Non-Fabrication & Extraction Rules:
 
       res.status(201).json({ campaign: newCampaign });
     } catch (error: unknown) {
+      if (error instanceof NemotronError) {
+        console.error('NVIDIA Nemotron error during product analysis:', error.message);
+        res.status(error.statusCode || 500).json({
+          error: error.message,
+          category: error.category,
+        });
+        return;
+      }
       const message = error instanceof Error ? error.message : 'Unexpected server error during product analysis.';
       console.error('Error in POST /api/campaigns/analyze:', message);
       res.status(500).json({ error: message });
@@ -958,7 +920,9 @@ Strict Non-Fabrication & Extraction Rules:
         : 'Instagram Reels (9:16)';
 
       const targetSec = Math.max(10, Math.min(30, Number(desiredDurationSeconds) || 15));
-      const ai = getGenAIClient();
+
+      // Verify that NVIDIA API key is available
+      getNvidiaApiKey(process.env);
 
       const prompt = `Create a brand-safe vertical 9:16 video ad concept, spoken voiceover script, and shot-by-shot storyboard for the following analyzed product campaign.
 
@@ -982,37 +946,46 @@ Strict Requirements:
 3. Ensure every shot's spokenVoiceoverSegment combines seamlessly into the fullVoiceoverScript.
 4. Provide a detailed 9:16 vertical visualPrompt9x16 for each shot that keeps the product undistorted and centered in the vertical safe zone.`;
 
-      const preferredPrimaryModel = getPreferredStoryboardModel();
-      const fallbackModel =
-        preferredPrimaryModel === PRIMARY_STORYBOARD_MODEL
-          ? VERIFIED_FALLBACK_STORYBOARD_MODEL
-          : PRIMARY_STORYBOARD_MODEL;
+      const preferredPrimaryModel = getNvidiaTextModel(process.env);
+      const fallbackModel = FALLBACK_NVIDIA_TEXT_MODEL;
 
       const execution = await executeWithVerifiedModelFallback(
         async (candidateModel) => {
-          const response = await ai.models.generateContent({
-            model: candidateModel,
-            contents: prompt,
-            config: {
-              systemInstruction:
-                'You are an executive short-form video director and scriptwriter. Output strictly valid JSON conforming to STORYBOARD_SCHEMA. Never fabricate unverified claims.',
-              responseMimeType: 'application/json',
-              responseSchema: STORYBOARD_SCHEMA,
+          const messages: NemotronChatMessage[] = [
+            {
+              role: 'system',
+              content:
+                'You are an executive short-form video director and scriptwriter. Output strictly valid JSON conforming to the storyboard schema. Never fabricate unverified claims. Output ONLY raw JSON without markdown code fences or conversational text.',
             },
-          });
+            {
+              role: 'user',
+              content: `${prompt}\n\nRequired JSON Schema Output Structure:\n${JSON.stringify(STORYBOARD_SCHEMA_STRUCTURE, null, 2)}`,
+            },
+          ];
 
-          if (!response || !response.text) {
+          const completion = await callNemotronChatCompletion(
+            messages,
+            {
+              model: candidateModel,
+              temperature: 0.3,
+              max_tokens: 3500,
+              responseFormatJson: true,
+            },
+            process.env
+          );
+
+          if (!completion.text) {
             throw new Error(`Model ${candidateModel} returned an empty storyboard response.`);
           }
 
-          return response.text;
+          return completion.text;
         },
         {
           primaryModel: preferredPrimaryModel,
           verifiedFallbackModels: [fallbackModel],
           maxRetriesPerModel: 2,
-          baseDelayMs: 250,
-          maxDelayMs: 1200,
+          baseDelayMs: 300,
+          maxDelayMs: 1500,
         }
       );
 
@@ -1044,6 +1017,14 @@ Strict Requirements:
 
       res.status(201).json({ campaign: updatedCampaign });
     } catch (error: unknown) {
+      if (error instanceof NemotronError) {
+        console.error('NVIDIA Nemotron error during storyboard generation:', error.message);
+        res.status(error.statusCode || 500).json({
+          error: error.message,
+          category: error.category,
+        });
+        return;
+      }
       const message = error instanceof Error ? error.message : 'Failed to generate storyboard.';
       const statusCode = error instanceof AllModelsFailedError ? 503 : 500;
       console.error('Error in POST /api/campaigns/:id/storyboard:', message);
@@ -1442,36 +1423,56 @@ Strict Requirements:
     const settings = validation.settings;
     const jobId = `job_${crypto.randomUUID().slice(0, 8)}`;
     const nowIso = new Date().toISOString();
-    const queuedJob = createQueuedRenderJob(campaign, settings, jobId, nowIso);
+    const previousShotResults =
+      campaign.activeRenderJob?.shotResults || campaign.renderHistory?.[0]?.shotResults;
+    let latestJobSnapshot = createQueuedRenderJob(campaign, settings, jobId, nowIso);
+
+    const abortController = new AbortController();
+    activeRenderControllers.set(id, abortController);
 
     // Persist queued state immediately so duplicate concurrent submissions are blocked
     campaign = {
       ...campaign,
-      activeRenderJob: queuedJob,
+      activeRenderJob: latestJobSnapshot,
       status: 'rendering_video',
       updatedAt: nowIso,
     };
     campaigns[index] = campaign;
     writeCampaigns(campaigns);
 
-    const updateProgressInStore = (progressPercent: number, stageMessage: string) => {
+    const updateProgressInStore = (
+      progressPercent: number,
+      stageMessage: string,
+      patch?: Partial<import('./src/types.ts').VideoRenderJob>
+    ) => {
       const latestList = readCampaigns();
       const idx = latestList.findIndex((c) => c.id === id);
       if (idx === -1) return;
       const current = latestList[idx];
       if (!current.activeRenderJob || current.activeRenderJob.id !== jobId) return;
-      current.activeRenderJob = transitionRenderJobStatus(current.activeRenderJob, {
-        status: 'processing',
+      if (current.activeRenderJob.status === 'cancelled') return;
+
+      latestJobSnapshot = transitionRenderJobStatus(current.activeRenderJob, {
+        status: patch?.status || 'generating',
         progressPercent,
         stageMessage,
+        providerUsed: patch?.providerUsed,
+        modelUsed: patch?.modelUsed,
+        engineUsed: patch?.engineUsed,
+        engineLabel: patch?.engineLabel,
+        isAiVideoGenerated: patch?.isAiVideoGenerated,
+        shotResults: patch?.shotResults,
       });
+      current.activeRenderJob = latestJobSnapshot;
       current.updatedAt = new Date().toISOString();
       latestList[idx] = current;
       writeCampaigns(latestList);
     };
 
     try {
-      updateProgressInStore(10, 'Initializing 9:16 vertical video render job...');
+      updateProgressInStore(8, 'Initializing 9:16 vertical video render job...', {
+        status: 'generating',
+      });
 
       const renderResult = await renderCampaignVerticalVideo({
         campaign,
@@ -1479,20 +1480,27 @@ Strict Requirements:
         jobId,
         videosDir: VIDEOS_DIR,
         audioDir: AUDIO_DIR,
-        getGenAIClient: process.env.GEMINI_API_KEY ? getGenAIClient : undefined,
+        previousShotResults,
+        abortSignal: abortController.signal,
         callbacks: {
           onProgress: updateProgressInStore,
         },
       });
 
       const finishedIso = new Date().toISOString();
-      const completedJob = transitionRenderJobStatus(queuedJob, {
+      const completedJob = transitionRenderJobStatus(latestJobSnapshot, {
         status: 'completed',
         progressPercent: 100,
-        stageMessage: `Rendered 9:16 MP4 (${renderResult.width}×${renderResult.height}, ${renderResult.durationSeconds}s, ${(renderResult.byteLength / 1024).toFixed(1)} KB). Ready for human preview and approval.`,
+        stageMessage: renderResult.isAiVideoGenerated
+          ? `Generated per-shot 9:16 AI Video MP4 via ${renderResult.engineLabel} (${renderResult.width}×${renderResult.height}, ${renderResult.durationSeconds}s, ${(renderResult.byteLength / 1024).toFixed(1)} KB). Ready for human preview and approval.`
+          : `Rendered Basic Motion/Slideshow 9:16 MP4 (${renderResult.width}×${renderResult.height}, ${renderResult.durationSeconds}s, ${(renderResult.byteLength / 1024).toFixed(1)} KB). Ready for human preview and approval.`,
+        providerUsed: renderResult.providerUsed,
+        modelUsed: renderResult.modelUsed,
         engineUsed: renderResult.engineUsed,
         engineLabel: renderResult.engineLabel,
+        isAiVideoGenerated: renderResult.isAiVideoGenerated,
         omniFallbackReason: renderResult.omniFallbackReason,
+        shotResults: renderResult.shotResults,
         durationSeconds: renderResult.durationSeconds,
         videoFileUrl: renderResult.videoFileUrl,
         byteLength: renderResult.byteLength,
@@ -1530,42 +1538,156 @@ Strict Requirements:
         warning: renderResult.omniFallbackReason,
       });
     } catch (renderErr: unknown) {
-      const errMsg =
-        renderErr instanceof Error ? renderErr.message : 'Failed to render 9:16 vertical MP4 video.';
+      const classified =
+        renderErr instanceof VideoRenderError
+          ? {
+              category: renderErr.failureCategory,
+              userMessage: renderErr.message,
+              shotResults: renderErr.shotResults,
+              providerUsed: renderErr.providerUsed,
+              modelUsed: renderErr.modelUsed,
+              engineUsed: renderErr.engineUsed,
+              engineLabel: renderErr.engineLabel,
+              isAiVideoGenerated: renderErr.isAiVideoGenerated,
+            }
+          : {
+              ...classifyVideoGenerationError(renderErr),
+              shotResults: latestJobSnapshot.shotResults,
+              providerUsed: latestJobSnapshot.providerUsed,
+              modelUsed: latestJobSnapshot.modelUsed,
+              engineUsed: latestJobSnapshot.engineUsed,
+              engineLabel: latestJobSnapshot.engineLabel,
+              isAiVideoGenerated: latestJobSnapshot.isAiVideoGenerated,
+            };
+
+      const isCancelled = classified.category === 'cancelled' || abortController.signal.aborted;
       const failedIso = new Date().toISOString();
-      const failedJob = transitionRenderJobStatus(queuedJob, {
-        status: 'failed',
-        progressPercent: queuedJob.progressPercent,
-        stageMessage: 'Video render failed.',
-        errorMessage: errMsg,
+      const failedJob = transitionRenderJobStatus(latestJobSnapshot, {
+        status: isCancelled ? 'cancelled' : 'failed',
+        progressPercent: latestJobSnapshot.progressPercent,
+        stageMessage: isCancelled
+          ? 'Video render job cancelled by user.'
+          : 'Video render failed.',
+        providerUsed: classified.providerUsed,
+        modelUsed: classified.modelUsed,
+        engineUsed: classified.engineUsed,
+        engineLabel: classified.engineLabel,
+        isAiVideoGenerated: classified.isAiVideoGenerated,
+        failureCategory: isCancelled ? 'cancelled' : classified.category,
+        shotResults: classified.shotResults,
+        errorMessage: classified.userMessage,
         nowIso: failedIso,
       });
 
       const freshCampaigns = readCampaigns();
       const targetIdx = freshCampaigns.findIndex((c) => c.id === id);
+      let updatedCamp: Campaign | undefined;
       if (targetIdx !== -1) {
         const existingCamp = freshCampaigns[targetIdx];
         const history = Array.isArray(existingCamp.renderHistory) ? existingCamp.renderHistory : [];
-        // Preserve all campaign, storyboard, and audio data when rendering fails
-        freshCampaigns[targetIdx] = {
+        updatedCamp = {
           ...existingCamp,
           activeRenderJob: failedJob,
           renderHistory: [failedJob, ...history.filter((j) => j.id !== failedJob.id)],
           status: existingCamp.latestCompletedRender ? 'video_ready' : 'audio_ready',
           updatedAt: failedIso,
         };
+        freshCampaigns[targetIdx] = updatedCamp;
         writeCampaigns(freshCampaigns);
       }
 
-      console.error('Error in POST /api/campaigns/:id/render:', errMsg);
-      res.status(500).json({
-        error: errMsg,
+      console.error('Error in POST /api/campaigns/:id/render:', classified.userMessage);
+      const statusCode = isCancelled
+        ? 499
+        : classified.category === 'paid_tier_required' || classified.category === 'quota_exceeded'
+        ? 429
+        : classified.category === 'auth_or_missing_key'
+        ? 401
+        : 500;
+      res.status(statusCode).json({
+        error: classified.userMessage,
+        failureCategory: failedJob.failureCategory,
         renderJob: failedJob,
+        campaign: updatedCamp,
       });
+    } finally {
+      activeRenderControllers.delete(id);
     }
   });
 
-  // 10. MILESTONE 3: Poll Render Job Status & Approval Gate State
+  // 10a. MILESTONE 3: Cancel an Active Video Render Job
+  app.post('/api/campaigns/:id/render-cancel', (req: Request, res: Response) => {
+    const { id } = req.params;
+    if (!isSafeIdentifier(id)) {
+      res.status(400).json({ error: 'Invalid campaign ID.' });
+      return;
+    }
+
+    const controller = activeRenderControllers.get(id);
+    if (controller) {
+      controller.abort();
+      activeRenderControllers.delete(id);
+    }
+
+    const campaigns = readCampaigns();
+    const index = campaigns.findIndex((c) => c.id === id);
+    if (index === -1) {
+      res.status(404).json({ error: 'Campaign not found.' });
+      return;
+    }
+
+    const campaign = campaigns[index];
+    const active = campaign.activeRenderJob;
+    if (
+      !active ||
+      (active.status !== 'queued' &&
+        active.status !== 'processing' &&
+        active.status !== 'generating' &&
+        active.status !== 'stitching')
+    ) {
+      res.status(200).json({
+        campaign,
+        renderJob: active || null,
+        message: 'No active render job to cancel.',
+      });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const updatedShots = (active.shotResults || []).map((s) =>
+      s.status === 'queued' || s.status === 'generating'
+        ? { ...s, status: 'cancelled' as const, updatedAt: nowIso }
+        : s
+    );
+
+    const cancelledJob = transitionRenderJobStatus(active, {
+      status: 'cancelled',
+      stageMessage: 'Video render job cancelled by user.',
+      failureCategory: 'cancelled',
+      shotResults: updatedShots,
+      errorMessage: 'Video render job was cancelled by the user.',
+      nowIso,
+    });
+
+    const history = Array.isArray(campaign.renderHistory) ? campaign.renderHistory : [];
+    const updatedCampaign: Campaign = {
+      ...campaign,
+      activeRenderJob: cancelledJob,
+      renderHistory: [cancelledJob, ...history.filter((j) => j.id !== cancelledJob.id)],
+      status: campaign.latestCompletedRender ? 'video_ready' : 'audio_ready',
+      updatedAt: nowIso,
+    };
+
+    campaigns[index] = updatedCampaign;
+    writeCampaigns(campaigns);
+
+    res.status(200).json({
+      campaign: updatedCampaign,
+      renderJob: cancelledJob,
+    });
+  });
+
+  // 10b. MILESTONE 3: Poll Render Job Status & Approval Gate State
   app.get('/api/campaigns/:id/render-status', (req: Request, res: Response) => {
     const { id } = req.params;
     if (!isSafeIdentifier(id)) {

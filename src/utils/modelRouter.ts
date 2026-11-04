@@ -1,19 +1,24 @@
 import type { VideoConceptAndStoryboard } from '../types.ts';
 import { recomputeShotTimecodes } from './milestone2Validators.ts';
+import {
+  DEFAULT_NVIDIA_TEXT_MODEL,
+  FALLBACK_NVIDIA_TEXT_MODEL,
+  DEFAULT_NVIDIA_VISION_MODEL,
+  extractJsonFromText,
+} from './nemotronClient.ts';
 
 /**
- * The API & Milestones live verification probe confirms `gemini-3.1-flash-lite` is
- * Verified Available on the active API key while `gemini-3.8-flash` experiences
- * 503 high-demand errors. Both models support structured JSON output with STORYBOARD_SCHEMA.
- *
- * Therefore, storyboard generation routes to the verified available model (`gemini-3.1-flash-lite`)
- * first, with bounded exponential backoff retries for transient 503/UNAVAILABLE errors,
- * and falls back only to task-verified models (`gemini-3.8-flash`).
+ * Storyboard, Ad Script, and Shot Prompt generation uses NVIDIA Nemotron models:
+ * - Primary Text/Storyboard: nvidia/llama-3.1-nemotron-70b-instruct (or process.env.NVIDIA_TEXT_MODEL)
+ * - Fallback Text/Storyboard: nvidia/nemotron-4-340b-instruct
+ * - Multimodal Vision Product Analysis: nvidia/nemotron-3.5-super-vl-120b-a12b (or process.env.NVIDIA_VISION_MODEL)
  */
-export const VERIFIED_AVAILABLE_STORYBOARD_MODEL = 'gemini-3.1-flash-lite';
-export const SECONDARY_STORYBOARD_MODEL = 'gemini-3.8-flash';
+export const VERIFIED_AVAILABLE_STORYBOARD_MODEL = DEFAULT_NVIDIA_TEXT_MODEL;
+export const SECONDARY_STORYBOARD_MODEL = FALLBACK_NVIDIA_TEXT_MODEL;
 export const PRIMARY_STORYBOARD_MODEL = VERIFIED_AVAILABLE_STORYBOARD_MODEL;
 export const VERIFIED_FALLBACK_STORYBOARD_MODEL = SECONDARY_STORYBOARD_MODEL;
+
+export const PRIMARY_VISION_MODEL = DEFAULT_NVIDIA_VISION_MODEL;
 
 export const PRIMARY_TTS_MODEL = 'gemini-3.8-flash-lite-tts';
 export const FALLBACK_TTS_MODEL = 'gemini-3.8-flash-tts';
@@ -23,8 +28,10 @@ export const FALLBACK_TTS_MODEL = 'gemini-3.8-flash-tts';
  * for this task are eligible in the storyboard model chain.
  */
 export const SUPPORTED_STORYBOARD_TASK_MODELS: ReadonlySet<string> = new Set([
-  VERIFIED_AVAILABLE_STORYBOARD_MODEL,
-  SECONDARY_STORYBOARD_MODEL,
+  DEFAULT_NVIDIA_TEXT_MODEL,
+  FALLBACK_NVIDIA_TEXT_MODEL,
+  DEFAULT_NVIDIA_VISION_MODEL,
+  'gemini-3.1-flash-lite', // Legacy fallback support if configured
 ]);
 
 export const SUPPORTED_TTS_TASK_MODELS: ReadonlySet<string> = new Set([
@@ -33,10 +40,9 @@ export const SUPPORTED_TTS_TASK_MODELS: ReadonlySet<string> = new Set([
 ]);
 
 // Ordered list of models verified as available by the server's live probe.
-// Defaults to ['gemini-3.1-flash-lite', 'gemini-3.8-flash'] with gemini-3.1-flash-lite first.
 let liveVerifiedOrderedModels: string[] = [
-  VERIFIED_AVAILABLE_STORYBOARD_MODEL,
-  SECONDARY_STORYBOARD_MODEL,
+  DEFAULT_NVIDIA_TEXT_MODEL,
+  FALLBACK_NVIDIA_TEXT_MODEL,
 ];
 
 export function markModelVerifiedAvailable(modelId: string): void {
@@ -55,7 +61,6 @@ export function setVerifiedAvailableModels(modelIds: Iterable<string>): void {
     }
   }
   if (valid.length > 0) {
-    // Keep any other task-supported model as a verified schema-compatible fallback
     for (const supported of SUPPORTED_STORYBOARD_TASK_MODELS) {
       if (!valid.includes(supported)) {
         valid.push(supported);
@@ -64,8 +69,8 @@ export function setVerifiedAvailableModels(modelIds: Iterable<string>): void {
     liveVerifiedOrderedModels = valid;
   } else {
     liveVerifiedOrderedModels = [
-      VERIFIED_AVAILABLE_STORYBOARD_MODEL,
-      SECONDARY_STORYBOARD_MODEL,
+      DEFAULT_NVIDIA_TEXT_MODEL,
+      FALLBACK_NVIDIA_TEXT_MODEL,
     ];
   }
 }
@@ -75,7 +80,9 @@ export function getVerifiedAvailableModels(): string[] {
 }
 
 export function getPreferredStoryboardModel(): string {
-  return liveVerifiedOrderedModels[0] || VERIFIED_AVAILABLE_STORYBOARD_MODEL;
+  const envModel = (process.env.NVIDIA_TEXT_MODEL || '').trim();
+  if (envModel) return envModel;
+  return liveVerifiedOrderedModels[0] || DEFAULT_NVIDIA_TEXT_MODEL;
 }
 
 export interface ModelAttemptRecord {
@@ -111,9 +118,8 @@ const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Detects whether an error from the Gemini SDK / HTTP transport is a transient
- * availability or rate-limit condition (e.g., 503 UNAVAILABLE, high demand, overloaded,
- * 429 RESOURCE_EXHAUSTED, 502/504 gateway timeout, or network reset).
+ * Detects whether an error from the API/HTTP transport is a transient
+ * availability or rate-limit condition (e.g., 503 UNAVAILABLE, 429 rate limit, 502/504 gateway timeout, or network reset).
  */
 export function isTransientGeminiError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? '');
@@ -151,9 +157,8 @@ export function computeExponentialBackoffMs(
 
 /**
  * Builds the ordered list of models to try:
- * 1. Primary verified available model (default: gemini-3.1-flash-lite)
- * 2. Only verified, task-supported fallback models (e.g. gemini-3.8-flash)
- * Filters out any unverified or unsupported model IDs.
+ * 1. Primary verified available model (default: nvidia/llama-3.1-nemotron-70b-instruct)
+ * 2. Only verified, task-supported fallback models (e.g. nvidia/nemotron-4-340b-instruct)
  */
 export function buildVerifiedStoryboardModelChain(
   primaryModel: string = getPreferredStoryboardModel(),
@@ -161,10 +166,10 @@ export function buildVerifiedStoryboardModelChain(
   supportedSet: ReadonlySet<string> = SUPPORTED_STORYBOARD_TASK_MODELS
 ): string[] {
   const chain: string[] = [];
-  if (primaryModel && supportedSet.has(primaryModel)) {
+  if (primaryModel && (supportedSet.has(primaryModel) || primaryModel.startsWith('nvidia/'))) {
     chain.push(primaryModel);
   } else {
-    const defaultPrimary = Array.from(supportedSet)[0] || VERIFIED_AVAILABLE_STORYBOARD_MODEL;
+    const defaultPrimary = Array.from(supportedSet)[0] || DEFAULT_NVIDIA_TEXT_MODEL;
     chain.push(defaultPrimary);
   }
 
@@ -190,8 +195,8 @@ export class AllModelsFailedError extends Error {
 }
 
 /**
- * Executes a Gemini generation operation starting with the verified available primary model,
- * retrying transient 503/UNAVAILABLE errors with bounded exponential backoff,
+ * Executes a model operation starting with the verified available primary model,
+ * retrying transient 429/503/timeout errors with bounded exponential backoff,
  * and falling back only to verified task-supported models.
  *
  * Never fabricates a result if all configured models fail.
@@ -240,9 +245,9 @@ export async function executeWithVerifiedModelFallback<T>(
         const latencyMs = Date.now() - startTime;
         const fallbackUsed = modelId !== effectivePrimary;
         const fallbackReason = fallbackUsed
-          ? `Primary model ${effectivePrimary} failed (${primaryFailureSummary || '503 UNAVAILABLE'}); succeeded using verified fallback model ${modelId}.`
+          ? `Primary model ${effectivePrimary} failed (${primaryFailureSummary || 'transient error'}); succeeded using verified fallback model ${modelId}.`
           : attempt > 1
-          ? `Model ${modelId} recovered on attempt ${attempt} after transient 503/UNAVAILABLE retry.`
+          ? `Model ${modelId} recovered on attempt ${attempt} after retry.`
           : undefined;
 
         return {
@@ -295,14 +300,14 @@ export async function executeWithVerifiedModelFallback<T>(
     .join(' | ');
 
   throw new AllModelsFailedError(
-    `Generation failed after trying all verified Gemini models. [${perModelSummary}]`,
+    `Generation failed after trying all verified models. [${perModelSummary}]`,
     effectivePrimary,
     attempts
   );
 }
 
 /**
- * Validates and normalizes the raw JSON storyboard returned by Gemini.
+ * Validates and normalizes the raw JSON storyboard returned by Nemotron.
  * Ensures no empty or fabricated storyboard can be saved as successful.
  */
 export function parseAndValidateGeneratedStoryboard(
@@ -311,14 +316,15 @@ export function parseAndValidateGeneratedStoryboard(
   generationMetadata: VideoConceptAndStoryboard['generationMetadata']
 ): VideoConceptAndStoryboard {
   if (!rawJsonText || !rawJsonText.trim()) {
-    throw new Error('Gemini returned an empty storyboard response.');
+    throw new Error('Model returned an empty storyboard response.');
   }
 
+  const cleanJson = extractJsonFromText(rawJsonText);
   let parsed: Record<string, unknown>;
   try {
-    parsed = JSON.parse(rawJsonText.trim()) as Record<string, unknown>;
+    parsed = JSON.parse(cleanJson) as Record<string, unknown>;
   } catch {
-    throw new Error('Gemini returned malformed JSON for the storyboard.');
+    throw new Error('Model returned malformed JSON for the storyboard.');
   }
 
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {

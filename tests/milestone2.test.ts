@@ -37,6 +37,20 @@ import {
   executeWithVerifiedModelFallback,
   parseAndValidateGeneratedStoryboard,
 } from '../src/utils/modelRouter.ts';
+import {
+  getNvidiaApiKey,
+  getNvidiaBaseUrl,
+  getNvidiaVisionModel,
+  getNvidiaTextModel,
+  DEFAULT_NVIDIA_VISION_MODEL,
+  DEFAULT_NVIDIA_TEXT_MODEL,
+  FALLBACK_NVIDIA_TEXT_MODEL,
+  extractJsonFromText,
+  isTransientNemotronStatus,
+  callNemotronChatCompletion,
+  executeWithNemotronFallback,
+  NemotronError,
+} from '../src/utils/nemotronClient.ts';
 import type {
   Campaign,
   ProductProfile,
@@ -695,8 +709,8 @@ describe('Image-Based Product Identification & Non-Fabrication Extraction Suite'
         imageDataUrl: uploadedSerumImage,
         productProfile: mockExtractedProfile,
         analysisMetadata: {
-          requestedModel: 'gemini-3.1-flash-lite',
-          resolvedModel: 'gemini-3.1-flash-lite',
+          requestedModel: 'nvidia/nemotron-3.5-super-vl-120b-a12b',
+          resolvedModel: 'nvidia/nemotron-3.5-super-vl-120b-a12b',
           fallbackUsed: false,
           latencyMs: 580,
           analyzedAt: '2026-11-04T01:00:00.000Z',
@@ -884,11 +898,11 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
     ],
   });
 
-  it('uses verified available model (gemini-3.1-flash-lite) first for storyboard generation and preserves user selections', async () => {
+  it('uses verified available model (nvidia/llama-3.1-nemotron-70b-instruct) first for storyboard generation and preserves user selections', async () => {
     const preferredPrimary = getPreferredStoryboardModel();
-    assert.equal(PRIMARY_STORYBOARD_MODEL, 'gemini-3.1-flash-lite');
-    assert.equal(VERIFIED_FALLBACK_STORYBOARD_MODEL, 'gemini-3.8-flash');
-    assert.equal(preferredPrimary, 'gemini-3.1-flash-lite');
+    assert.equal(PRIMARY_STORYBOARD_MODEL, DEFAULT_NVIDIA_TEXT_MODEL);
+    assert.equal(VERIFIED_FALLBACK_STORYBOARD_MODEL, FALLBACK_NVIDIA_TEXT_MODEL);
+    assert.equal(preferredPrimary, DEFAULT_NVIDIA_TEXT_MODEL);
 
     const calledModels: string[] = [];
     const sleepDelays: number[] = [];
@@ -908,10 +922,10 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
       }
     );
 
-    assert.deepEqual(calledModels, ['gemini-3.1-flash-lite']);
+    assert.deepEqual(calledModels, [DEFAULT_NVIDIA_TEXT_MODEL]);
     assert.deepEqual(sleepDelays, []);
-    assert.equal(execution.requestedModel, 'gemini-3.1-flash-lite');
-    assert.equal(execution.resolvedModel, 'gemini-3.1-flash-lite');
+    assert.equal(execution.requestedModel, DEFAULT_NVIDIA_TEXT_MODEL);
+    assert.equal(execution.resolvedModel, DEFAULT_NVIDIA_TEXT_MODEL);
     assert.equal(execution.fallbackUsed, false);
     assert.equal(execution.fallbackReason, undefined);
 
@@ -942,14 +956,14 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
     const execution = await executeWithVerifiedModelFallback(
       async (modelId, attempt) => {
         attemptLog.push({ modelId, attempt });
-        if (modelId === 'gemini-3.1-flash-lite' && attempt === 1) {
-          throw new Error('503 UNAVAILABLE: Transient spike on gemini-3.1-flash-lite.');
+        if (modelId === DEFAULT_NVIDIA_TEXT_MODEL && attempt === 1) {
+          throw new Error(`503 UNAVAILABLE: Transient spike on ${DEFAULT_NVIDIA_TEXT_MODEL}.`);
         }
         return validRawStoryboardJson;
       },
       {
-        primaryModel: 'gemini-3.1-flash-lite',
-        verifiedFallbackModels: ['gemini-3.8-flash'],
+        primaryModel: DEFAULT_NVIDIA_TEXT_MODEL,
+        verifiedFallbackModels: [FALLBACK_NVIDIA_TEXT_MODEL],
         maxRetriesPerModel: 2,
         baseDelayMs: 250,
         maxDelayMs: 1000,
@@ -960,23 +974,22 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
     );
 
     assert.deepEqual(attemptLog, [
-      { modelId: 'gemini-3.1-flash-lite', attempt: 1 },
-      { modelId: 'gemini-3.1-flash-lite', attempt: 2 },
+      { modelId: DEFAULT_NVIDIA_TEXT_MODEL, attempt: 1 },
+      { modelId: DEFAULT_NVIDIA_TEXT_MODEL, attempt: 2 },
     ]);
     assert.deepEqual(backoffLog, [250]);
-    assert.equal(execution.requestedModel, 'gemini-3.1-flash-lite');
-    assert.equal(execution.resolvedModel, 'gemini-3.1-flash-lite');
+    assert.equal(execution.requestedModel, DEFAULT_NVIDIA_TEXT_MODEL);
+    assert.equal(execution.resolvedModel, DEFAULT_NVIDIA_TEXT_MODEL);
     assert.equal(execution.fallbackUsed, false);
   });
 
   it('retries transient 503/UNAVAILABLE with bounded exponential backoff and falls back only to verified supported model', async () => {
     // Ensure unverified or unsupported models are filtered out of the chain
-    const chain = buildVerifiedStoryboardModelChain('gemini-3.1-flash-lite', [
+    const chain = buildVerifiedStoryboardModelChain(DEFAULT_NVIDIA_TEXT_MODEL, [
       'unverified-experimental-model',
-      'gemini-flash-latest',
-      'gemini-3.8-flash',
+      FALLBACK_NVIDIA_TEXT_MODEL,
     ]);
-    assert.deepEqual(chain, ['gemini-3.1-flash-lite', 'gemini-3.8-flash']);
+    assert.deepEqual(chain, [DEFAULT_NVIDIA_TEXT_MODEL, FALLBACK_NVIDIA_TEXT_MODEL]);
 
     // Verify bounded exponential backoff calculation
     assert.equal(computeExponentialBackoffMs(0, 250, 1000), 250);
@@ -990,14 +1003,14 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
     const execution = await executeWithVerifiedModelFallback(
       async (modelId, attempt) => {
         attemptLog.push({ modelId, attempt });
-        if (modelId === 'gemini-3.1-flash-lite') {
+        if (modelId === DEFAULT_NVIDIA_TEXT_MODEL) {
           throw new Error('503 UNAVAILABLE: Primary model experiencing high demand.');
         }
         return validRawStoryboardJson;
       },
       {
-        primaryModel: 'gemini-3.1-flash-lite',
-        verifiedFallbackModels: ['unverified-model', 'gemini-3.8-flash'],
+        primaryModel: DEFAULT_NVIDIA_TEXT_MODEL,
+        verifiedFallbackModels: [FALLBACK_NVIDIA_TEXT_MODEL],
         maxRetriesPerModel: 2,
         baseDelayMs: 250,
         maxDelayMs: 1000,
@@ -1009,16 +1022,16 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
 
     // Primary tried 3 times (initial + 2 bounded retries with 250ms, 500ms backoff), then verified fallback succeeded on attempt 1
     assert.deepEqual(attemptLog, [
-      { modelId: 'gemini-3.1-flash-lite', attempt: 1 },
-      { modelId: 'gemini-3.1-flash-lite', attempt: 2 },
-      { modelId: 'gemini-3.1-flash-lite', attempt: 3 },
-      { modelId: 'gemini-3.8-flash', attempt: 1 },
+      { modelId: DEFAULT_NVIDIA_TEXT_MODEL, attempt: 1 },
+      { modelId: DEFAULT_NVIDIA_TEXT_MODEL, attempt: 2 },
+      { modelId: DEFAULT_NVIDIA_TEXT_MODEL, attempt: 3 },
+      { modelId: FALLBACK_NVIDIA_TEXT_MODEL, attempt: 1 },
     ]);
     assert.deepEqual(backoffLog, [250, 500]);
-    assert.equal(execution.requestedModel, 'gemini-3.1-flash-lite');
-    assert.equal(execution.resolvedModel, 'gemini-3.8-flash');
+    assert.equal(execution.requestedModel, DEFAULT_NVIDIA_TEXT_MODEL);
+    assert.equal(execution.resolvedModel, FALLBACK_NVIDIA_TEXT_MODEL);
     assert.equal(execution.fallbackUsed, true);
-    assert.match(execution.fallbackReason || '', /gemini-3\.8-flash/);
+    assert.match(execution.fallbackReason || '', new RegExp(FALLBACK_NVIDIA_TEXT_MODEL));
   });
 
   it('throws a clear AllModelsFailedError and never fabricates a storyboard when all configured models fail', async () => {
@@ -1031,8 +1044,8 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
             throw new Error(`503 UNAVAILABLE on ${modelId}: service overloaded`);
           },
           {
-            primaryModel: 'gemini-3.1-flash-lite',
-            verifiedFallbackModels: ['gemini-3.8-flash'],
+            primaryModel: DEFAULT_NVIDIA_TEXT_MODEL,
+            verifiedFallbackModels: [FALLBACK_NVIDIA_TEXT_MODEL],
             maxRetriesPerModel: 1,
             baseDelayMs: 200,
             maxDelayMs: 800,
@@ -1045,9 +1058,8 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
       (err: unknown) => {
         assert.equal(err instanceof AllModelsFailedError, true);
         const allFailed = err as AllModelsFailedError;
-        assert.match(allFailed.message, /Generation failed after trying all verified Gemini models/);
-        assert.match(allFailed.message, /gemini-3\.1-flash-lite \(2 attempts\)/);
-        assert.match(allFailed.message, /gemini-3\.8-flash \(2 attempts\)/);
+        assert.match(allFailed.message, /Generation failed after trying all verified models/);
+        assert.match(allFailed.message, /2 attempts/);
         assert.equal(allFailed.attempts.length, 4);
         return true;
       }
@@ -1055,6 +1067,133 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
 
     // 1 retry on primary (200ms) + 1 retry on fallback (200ms)
     assert.deepEqual(backoffLog, [200, 200]);
+  });
+});
+
+describe('NVIDIA Nemotron Integration & Error Handling Suite', () => {
+  it('throws a clean NemotronError when NVIDIA_API_KEY is not configured', () => {
+    assert.throws(
+      () => getNvidiaApiKey({}),
+      (err: unknown) => {
+        assert.equal(err instanceof NemotronError, true);
+        const nemError = err as NemotronError;
+        assert.equal(nemError.category, 'missing_key');
+        assert.equal(nemError.statusCode, 401);
+        assert.equal(nemError.isTransient, false);
+        assert.match(nemError.message, /NVIDIA_API_KEY/);
+        return true;
+      }
+    );
+
+    // Returns key when set
+    assert.equal(getNvidiaApiKey({ NVIDIA_API_KEY: 'nvapi-test-key-123' }), 'nvapi-test-key-123');
+  });
+
+  it('extracts raw JSON cleanly from markdown code blocks or plain JSON text', () => {
+    const rawPlain = '{"detectedProductName": "Espresso Pro"}';
+    assert.equal(extractJsonFromText(rawPlain), rawPlain);
+
+    const markdownFence = '```json\n{"detectedProductName": "Espresso Pro"}\n```';
+    assert.equal(extractJsonFromText(markdownFence), '{"detectedProductName": "Espresso Pro"}');
+
+    const surroundingText = 'Here is the JSON:\n```json\n{"key": "value"}\n```\nHope this helps!';
+    assert.equal(extractJsonFromText(surroundingText), '{"key": "value"}');
+  });
+
+  it('correctly categorizes transient vs non-transient status codes and network errors', () => {
+    assert.equal(isTransientNemotronStatus(429), true);
+    assert.equal(isTransientNemotronStatus(503), true);
+    assert.equal(isTransientNemotronStatus(504), true);
+    assert.equal(isTransientNemotronStatus(401), false);
+    assert.equal(isTransientNemotronStatus(404), false);
+    assert.equal(isTransientNemotronStatus(undefined, 'rate limit exceeded'), true);
+    assert.equal(isTransientNemotronStatus(undefined, 'ECONNRESET'), true);
+    assert.equal(isTransientNemotronStatus(undefined, 'fetch failed'), true);
+  });
+
+  it('performs OpenAI-compatible chat completions using mock fetch and handles 401, 429, and timeouts cleanly', async () => {
+    // 1. Successful chat completion
+    const mockSuccessFetch = (async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl-123',
+          model: DEFAULT_NVIDIA_TEXT_MODEL,
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                content: '{"conceptTitle": "Nemotron Ad"}',
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }) as typeof fetch;
+
+    const successResult = await callNemotronChatCompletion(
+      [{ role: 'user', content: 'Create ad' }],
+      {},
+      { NVIDIA_API_KEY: 'nvapi-valid-test' },
+      mockSuccessFetch
+    );
+    assert.equal(successResult.text, '{"conceptTitle": "Nemotron Ad"}');
+    assert.equal(successResult.modelUsed, DEFAULT_NVIDIA_TEXT_MODEL);
+
+    // 2. 401 Auth error
+    const mockAuthErrorFetch = (async () => {
+      return new Response(JSON.stringify({ error: { message: 'Invalid API key' } }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    await assert.rejects(
+      async () => {
+        await callNemotronChatCompletion(
+          [{ role: 'user', content: 'Create ad' }],
+          {},
+          { NVIDIA_API_KEY: 'nvapi-invalid' },
+          mockAuthErrorFetch
+        );
+      },
+      (err: unknown) => {
+        assert.equal(err instanceof NemotronError, true);
+        const nemError = err as NemotronError;
+        assert.equal(nemError.category, 'auth_error');
+        assert.equal(nemError.statusCode, 401);
+        assert.equal(nemError.isTransient, false);
+        return true;
+      }
+    );
+
+    // 3. 429 Rate limit error
+    const mockRateLimitFetch = (async () => {
+      return new Response(JSON.stringify({ error: { message: 'Too many requests' } }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    await assert.rejects(
+      async () => {
+        await callNemotronChatCompletion(
+          [{ role: 'user', content: 'Create ad' }],
+          {},
+          { NVIDIA_API_KEY: 'nvapi-valid' },
+          mockRateLimitFetch
+        );
+      },
+      (err: unknown) => {
+        assert.equal(err instanceof NemotronError, true);
+        const nemError = err as NemotronError;
+        assert.equal(nemError.category, 'rate_limited');
+        assert.equal(nemError.statusCode, 429);
+        assert.equal(nemError.isTransient, true);
+        return true;
+      }
+    );
+
 
     // Also verify parseAndValidateGeneratedStoryboard rejects empty or incomplete payloads instead of fabricating
     assert.throws(
@@ -1459,6 +1598,7 @@ describe('Milestone 3 — 9:16 Video Rendering, MP4 Verification, Sync & Approva
         campaign: testCampaign,
         settings: {
           ...DEFAULT_RENDER_SETTINGS,
+          enginePreference: 'ffmpeg_motion_compositor',
           resolution: '1080x1920',
           includeSubtitles: true,
         },
@@ -1646,7 +1786,731 @@ describe('Milestone 3 — 9:16 Video Rendering, MP4 Verification, Sync & Approva
     const fpAfter = computeCampaignContentFingerprint(editedCampaign, DEFAULT_RENDER_SETTINGS);
     assert.notEqual(fpBefore, fpAfter);
   });
+
+  it('generates per-shot 9:16 AI video clips in ai_video_google_veo mode, tracks per-shot progress, supports retryFailedShotsOnly, cancels active jobs, and never silently substitutes the FFmpeg slideshow on unconfigured or failing server', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+
+    const {
+      verifyPlayableMp4Buffer,
+      verifyAudioVideoDurationSync,
+      buildCommercialShotVideoPrompt,
+    } = await import('../src/utils/milestone3Validators.ts');
+    const {
+      renderCampaignVerticalVideo,
+      probeRenderedVideoFile,
+      VideoRenderError,
+    } = await import('../src/utils/videoRenderer.ts');
+
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-ad-studio-veo-test-'));
+    const audioDir = path.join(tmpRoot, 'audio');
+    const videosDir = path.join(tmpRoot, 'videos');
+    fs.mkdirSync(audioDir, { recursive: true });
+    fs.mkdirSync(videosDir, { recursive: true });
+
+    try {
+      // Create a 3.0s 24kHz 16-bit mono WAV voiceover
+      const pcm3s = Buffer.alloc(24000 * 2 * 3, 0);
+      const wav3s = ensureValidWavBuffer(pcm3s, 24000, 1, 16);
+      const voFilename = 'voiceover-camp_veo_test.wav';
+      fs.writeFileSync(path.join(audioDir, voFilename), wav3s);
+
+      // Generate a real 2s 720x1280 animated test MP4 buffer to simulate Google Veo 2.0 MP4 output
+      const rawVeoSamplePath = path.join(tmpRoot, 'sample_veo_raw.mp4');
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc=duration=2:size=720x1280:rate=24',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-pix_fmt',
+        'yuv420p',
+        rawVeoSamplePath,
+      ]);
+      const sampleVeoMp4Buffer = fs.readFileSync(rawVeoSamplePath);
+      assert.equal(verifyPlayableMp4Buffer(sampleVeoMp4Buffer).valid, true);
+
+      const testCampaign: Campaign = {
+        id: 'camp_veo_test',
+        createdAt: '2026-11-04T00:00:00.000Z',
+        updatedAt: '2026-11-04T00:05:00.000Z',
+        status: 'audio_ready',
+        title: 'Veloce Barista Pro Espresso',
+        price: '$649',
+        brandName: 'Veloce Milano',
+        modelOrVariant: '9-Bar Dual Boiler',
+        visiblePackagingText: 'VELOCE MILANO',
+        brandVoice: 'Luxury & Editorial',
+        targetAudience: 'Inferred: Specialty coffee lovers',
+        visualStyle: 'Warm studio lighting',
+        imageDataUrl:
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        analysisMetadata: {
+          requestedModel: 'gemini-3.1-flash-lite',
+          resolvedModel: 'gemini-3.1-flash-lite',
+          fallbackUsed: false,
+          latencyMs: 320,
+          analyzedAt: '2026-11-04T00:00:00.000Z',
+        },
+        productProfile: {
+          detectedProductName: 'Veloce Barista Pro Espresso',
+          category: 'Kitchen Appliances',
+          subcategory: 'Espresso Makers',
+          productSummary: 'Matte obsidian dual-boiler espresso machine.',
+          dominantColors: [
+            { name: 'Matte Obsidian', hex: '#1C1917', usageRole: 'Body' },
+            { name: 'Warm Brass', hex: '#D97706', usageRole: 'Gauge' },
+          ],
+          materialsAndTextures: ['Brushed steel', 'Walnut wood'],
+          estimatedDimensions: '32cm x 28cm',
+          detectedFeatures: ['9-bar brass gauge'],
+          keySellingPoints: [],
+          brandVoiceGuidelines: {
+            toneDescriptors: ['Refined'],
+            wordsToUse: ['crema'],
+            wordsToAvoid: ['instant'],
+            targetPersonaSummary: 'Inferred: Coffee enthusiasts',
+          },
+          recommendedAdAngles: [],
+          visualFidelityConstraints: ['Preserve matte obsidian finish and brass gauge'],
+        },
+        storyboard: {
+          conceptTitle: '9-Bar Morning Ritual',
+          targetPlatformFormat: 'Instagram Reels (9:16)',
+          totalDurationSeconds: 3,
+          openingHook3s: 'Stop settling for bitter morning coffee.',
+          fullVoiceoverScript: 'Stop settling for bitter morning coffee. Experience 9-bar crema.',
+          estimatedWordCount: 9,
+          brandSafetyVerification: ['Verified'],
+          masterCinematicPrompt9x16: 'Vertical 9:16 commercial.',
+          musicDirectionPrompt: 'Acoustic groove',
+          shots: [
+            {
+              shotNumber: 1,
+              durationSeconds: 1,
+              timecodeRange: '00:00 - 00:01',
+              shotType: '01. Macro Hook',
+              sceneDescription: 'Brass pressure gauge rising to 9 bar.',
+              cameraMovement: '3D product orbit & slow push-in',
+              visualPrompt9x16: '9:16 macro gauge.',
+              onScreenTextOverlay: '9-Bar Precision',
+              spokenVoiceoverSegment: 'Stop settling for bitter morning coffee.',
+              productFidelityNote: 'Preserve brass dial.',
+            },
+            {
+              shotNumber: 2,
+              durationSeconds: 2,
+              timecodeRange: '00:01 - 00:03',
+              shotType: '02. Crema Pour',
+              sceneDescription: 'Rich tiger-stripe espresso extraction.',
+              cameraMovement: 'Low angle crane reveal',
+              visualPrompt9x16: '9:16 crema extraction.',
+              onScreenTextOverlay: 'Veloce Barista Pro · $649',
+              spokenVoiceoverSegment: 'Experience 9-bar crema.',
+              productFidelityNote: 'Preserve walnut portafilter.',
+            },
+          ],
+          generationMetadata: {
+            requestedModel: 'gemini-3.1-flash-lite',
+            resolvedModel: 'gemini-3.1-flash-lite',
+            fallbackUsed: false,
+            latencyMs: 410,
+            generatedAt: '2026-11-04T00:02:00.000Z',
+          },
+        },
+        voiceover: {
+          id: 'vo_veo_test',
+          voiceName: 'Kore',
+          voiceStyle: 'Warm narrator',
+          scriptTextUsed: 'Stop settling for bitter morning coffee. Experience 9-bar crema.',
+          audioFileUrl: `/api/audio/${voFilename}`,
+          mimeType: 'audio/wav',
+          byteLength: wav3s.length,
+          sampleRateHz: 24000,
+          durationEstimateSeconds: 3.0,
+          resolvedModel: PRIMARY_TTS_MODEL,
+          latencyMs: 700,
+          generatedAt: '2026-11-04T00:03:00.000Z',
+        },
+      };
+
+      // Verify commercial prompt builder includes product identity, camera motion, and fidelity constraints
+      const promptShot1 = buildCommercialShotVideoPrompt(
+        testCampaign,
+        testCampaign.storyboard!.shots[0]
+      );
+      assert.match(promptShot1, /Veloce Barista Pro Espresso/);
+      assert.match(promptShot1, /3D product orbit/);
+      assert.match(promptShot1, /Preserve brass dial/);
+
+      // 1. Verify unconfigured server error in ai_video_google_veo mode NEVER silently falls back to static slideshow
+      let unconfiguredErr: unknown = null;
+      try {
+        await renderCampaignVerticalVideo({
+          campaign: testCampaign,
+          settings: {
+            resolution: '720x1280',
+            includeSubtitles: true,
+            enginePreference: 'ai_video_google_veo',
+          },
+          jobId: 'job_veo_unconfigured',
+          audioDir,
+          videosDir,
+          omniShotGenerator: async () => {
+            throw new Error(
+              'Google AI API key (GEMINI_API_KEY or GOOGLE_API_KEY) is not set on the server.'
+            );
+          },
+        });
+      } catch (err) {
+        unconfiguredErr = err;
+      }
+
+      assert.ok(unconfiguredErr instanceof VideoRenderError);
+      assert.equal(
+        (unconfiguredErr as InstanceType<typeof VideoRenderError>).failureCategory,
+        'auth_or_missing_key'
+      );
+      assert.equal(
+        (unconfiguredErr as InstanceType<typeof VideoRenderError>).isAiVideoGenerated,
+        false
+      );
+      assert.equal(
+        (unconfiguredErr as InstanceType<typeof VideoRenderError>).shotResults[0].status,
+        'failed'
+      );
+      assert.equal(
+        (unconfiguredErr as InstanceType<typeof VideoRenderError>).shotResults[1].status,
+        'queued'
+      );
+
+      // 2. Verify partial shot failure (Shot 1 succeeds, Shot 2 fails) followed by retryFailedShotsOnly reusing Shot 1
+      const generatedShotsLog: number[] = [];
+      let partialErr: unknown = null;
+      try {
+        await renderCampaignVerticalVideo({
+          campaign: testCampaign,
+          settings: {
+            resolution: '720x1280',
+            includeSubtitles: true,
+            enginePreference: 'ai_video_google_veo',
+          },
+          jobId: 'job_veo_partial',
+          audioDir,
+          videosDir,
+          omniShotGenerator: async ({ shot }) => {
+            generatedShotsLog.push(shot.shotNumber);
+            if (shot.shotNumber === 2) {
+              throw new Error('429 rate_limit_exceeded on shot 2');
+            }
+            return {
+              videoBuffer: sampleVeoMp4Buffer,
+              modelUsed: 'veo-2.0-generate-001',
+            };
+          },
+        });
+      } catch (err) {
+        partialErr = err;
+      }
+
+      assert.ok(partialErr instanceof VideoRenderError);
+      const partialShots = (partialErr as InstanceType<typeof VideoRenderError>).shotResults;
+      assert.equal(partialShots[0].status, 'completed');
+      assert.equal(partialShots[1].status, 'failed');
+
+      // Now retry failed shots only — Shot 1 must be reused from disk, only Shot 2 generated
+      const retryShotsLog: number[] = [];
+      const progressEvents: number[] = [];
+      const retrySuccess = await renderCampaignVerticalVideo({
+        campaign: testCampaign,
+        settings: {
+          resolution: '720x1280',
+          includeSubtitles: true,
+          enginePreference: 'ai_video_google_veo',
+          retryFailedShotsOnly: true,
+        },
+        jobId: 'job_veo_retry_ok',
+        audioDir,
+        videosDir,
+        previousShotResults: partialShots,
+        callbacks: {
+          onProgress: (pct) => progressEvents.push(pct),
+        },
+        omniShotGenerator: async ({ shot }) => {
+          retryShotsLog.push(shot.shotNumber);
+          return {
+            videoBuffer: sampleVeoMp4Buffer,
+            modelUsed: 'veo-2.0-generate-001',
+          };
+        },
+      });
+
+      assert.deepEqual(retryShotsLog, [2], 'Should reuse Shot 1 and only generate Shot 2');
+      assert.ok(progressEvents.length >= 2, 'Should emit per-shot progress updates');
+      assert.equal(retrySuccess.isAiVideoGenerated, true);
+      assert.equal(retrySuccess.providerUsed, 'google_veo');
+      assert.equal(retrySuccess.modelUsed, 'veo-2.0-generate-001');
+      assert.equal(retrySuccess.engineUsed, 'google_veo_video');
+      assert.equal(retrySuccess.shotResults.length, 2);
+      assert.equal(retrySuccess.shotResults[0].status, 'completed');
+      assert.equal(retrySuccess.shotResults[1].status, 'completed');
+
+      const finalMp4Buf = fs.readFileSync(retrySuccess.outputFilePath);
+      assert.equal(verifyPlayableMp4Buffer(finalMp4Buf).valid, true);
+      const probe = await probeRenderedVideoFile(retrySuccess.outputFilePath);
+      assert.equal(probe.width, 720);
+      assert.equal(probe.height, 1280);
+      assert.equal(
+        verifyAudioVideoDurationSync({
+          targetDurationSeconds: 3,
+          videoDurationSeconds: probe.videoDurationSeconds,
+          audioDurationSeconds: probe.audioDurationSeconds,
+          toleranceSeconds: 1.0,
+        }).synchronized,
+        true
+      );
+
+      // 3. Verify job cancellation via AbortController
+      const abortController = new AbortController();
+      abortController.abort();
+      let cancelErr: unknown = null;
+      try {
+        await renderCampaignVerticalVideo({
+          campaign: testCampaign,
+          settings: {
+            resolution: '720x1280',
+            includeSubtitles: true,
+            enginePreference: 'ai_video_google_veo',
+          },
+          jobId: 'job_veo_cancel',
+          audioDir,
+          videosDir,
+          abortSignal: abortController.signal,
+          omniShotGenerator: async () => ({
+            videoBuffer: sampleVeoMp4Buffer,
+            modelUsed: 'veo-2.0-generate-001',
+          }),
+        });
+      } catch (err) {
+        cancelErr = err;
+      }
+      assert.ok(cancelErr instanceof VideoRenderError);
+      assert.equal((cancelErr as InstanceType<typeof VideoRenderError>).failureCategory, 'cancelled');
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('integrates GoogleVeoVideoProviderAdapter (@google/genai SDK, polling, cancellation, legacy campaign normalization) and Nano Banana visual generation', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+
+    const {
+      GoogleVeoVideoProviderAdapter,
+      resolveAiVideoProviderAdapter,
+      executeProviderShotGeneration,
+      getVideoProvidersSummary,
+      generateNanoBananaVisualAsset,
+      DEFAULT_GOOGLE_VEO_MODEL_ID,
+      DEFAULT_GOOGLE_IMAGE_MODEL_ID,
+    } = await import('../src/utils/videoProviders.ts');
+    const {
+      normalizeLegacyCampaignVideoFields,
+      normalizeRenderEnginePreference,
+      verifyPlayableMp4Buffer,
+    } = await import('../src/utils/milestone3Validators.ts');
+    const {
+      renderCampaignVerticalVideo,
+      probeRenderedVideoFile,
+      VideoRenderError,
+    } = await import('../src/utils/videoRenderer.ts');
+
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-ad-studio-veo-provider-test-'));
+    const audioDir = path.join(tmpRoot, 'audio');
+    const videosDir = path.join(tmpRoot, 'videos');
+    fs.mkdirSync(audioDir, { recursive: true });
+    fs.mkdirSync(videosDir, { recursive: true });
+
+    try {
+      // Create a 3.0s 24kHz 16-bit mono WAV voiceover
+      const pcm3s = Buffer.alloc(24000 * 2 * 3, 0);
+      const wav3s = ensureValidWavBuffer(pcm3s, 24000, 1, 16);
+      const voFilename = 'voiceover-camp_veo_provider_test.wav';
+      fs.writeFileSync(path.join(audioDir, voFilename), wav3s);
+
+      // Create a genuine 2s 720x1280 MP4 clip to simulate Veo 2.0 output
+      const sampleProviderClipPath = path.join(tmpRoot, 'veo_sample.mp4');
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc=duration=2:size=720x1280:rate=24',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-pix_fmt',
+        'yuv420p',
+        sampleProviderClipPath,
+      ]);
+      const sampleProviderMp4Buffer = fs.readFileSync(sampleProviderClipPath);
+
+      // 1. Verify unconfigured & configured summary
+      const unconfiguredSummary = getVideoProvidersSummary({ NODE_ENV: 'test' });
+      assert.equal(unconfiguredSummary.length, 1);
+      assert.equal(unconfiguredSummary[0].providerId, 'google_veo');
+      assert.equal(unconfiguredSummary[0].configured, false);
+      assert.equal(unconfiguredSummary[0].defaultModelId, DEFAULT_GOOGLE_VEO_MODEL_ID);
+
+      const configuredSummary = getVideoProvidersSummary({
+        NODE_ENV: 'test',
+        GEMINI_API_KEY: 'test_key_123',
+      });
+      assert.equal(configuredSummary[0].configured, true);
+      assert.equal(configuredSummary[0].modelAvailable, true);
+
+      // 2. Verify adapter initialization & resolver
+      const veoAdapter = new GoogleVeoVideoProviderAdapter();
+      assert.equal(veoAdapter.providerId, 'google_veo');
+      assert.equal(veoAdapter.enginePreference, 'ai_video_google_veo');
+      assert.equal(veoAdapter.engineUsed, 'google_veo_video');
+      assert.equal(veoAdapter.defaultModelId, 'veo-2.0-generate-001');
+
+      const resolved = resolveAiVideoProviderAdapter('ai_video_google_veo');
+      assert.equal(resolved.providerId, 'google_veo');
+
+      // 3. Verify operation polling and base64 video extraction
+      let pollCount = 0;
+      const fakeGenAIClient: any = {
+        models: {
+          generateVideos: async (params: any) => {
+            assert.equal(params.model, 'veo-2.0-generate-001');
+            assert.equal(params.config?.aspectRatio, '9:16');
+            return {
+              name: 'operations/veo_mock_op_42',
+              done: false,
+            };
+          },
+        },
+        operations: {
+          getVideosOperation: async () => {
+            pollCount += 1;
+            if (pollCount === 1) {
+              return { done: false };
+            }
+            return {
+              done: true,
+              response: {
+                generatedVideos: [
+                  {
+                    video: {
+                      videoBytes: sampleProviderMp4Buffer.toString('base64'),
+                      mimeType: 'video/mp4',
+                    },
+                  },
+                ],
+              },
+            };
+          },
+        },
+      };
+
+      const progressPcts: number[] = [];
+      const execResult = await executeProviderShotGeneration(veoAdapter, {
+        shot: {
+          shotNumber: 1,
+          durationSeconds: 4,
+          timecodeRange: '00:00 - 00:04',
+          shotType: '01. Hero',
+          sceneDescription: 'Orbit around espresso machine',
+          cameraMovement: 'Orbit',
+          visualPrompt9x16: '9:16 orbit',
+          onScreenTextOverlay: 'Veloce',
+          spokenVoiceoverSegment: 'Hello',
+          productFidelityNote: 'Preserve logo',
+        },
+        shotIndex: 0,
+        prompt: 'Vertical 9:16 commercial shot',
+        mimeType: 'image/png',
+        base64Data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        aspectRatio: '9:16',
+        durationSeconds: 4,
+        resolution: '720p',
+        client: fakeGenAIClient,
+        pollIntervalMs: 10,
+        onProgressUpdate: (_msg, pct) => {
+          if (typeof pct === 'number') progressPcts.push(pct);
+        },
+      });
+
+      assert.equal(execResult.providerId, 'google_veo');
+      assert.equal(execResult.modelUsed, 'veo-2.0-generate-001');
+      assert.equal(execResult.remoteJobId, 'operations/veo_mock_op_42');
+      assert.equal(execResult.videoBuffer.byteLength, sampleProviderMp4Buffer.byteLength);
+
+      // 4. Verify cancellation tracking
+      const cancelResult = await veoAdapter.cancelJob('operations/veo_mock_op_42');
+      assert.equal(cancelResult.cancelled, true);
+
+      // 5. Verify error classification
+      const authErr = veoAdapter.normalizeProviderError(new Error('401 Unauthorized API key'));
+      assert.equal(authErr.category, 'auth_or_missing_key');
+
+      const quotaErr = veoAdapter.normalizeProviderError(new Error('429 RESOURCE_EXHAUSTED quota exceeded'));
+      assert.equal(quotaErr.category, 'quota_exceeded');
+      assert.equal(quotaErr.retryable, true);
+
+      const notFoundErr = veoAdapter.normalizeProviderError(new Error('404 model not found'));
+      assert.equal(notFoundErr.category, 'model_unavailable');
+
+      const billingErr = veoAdapter.normalizeProviderError(new Error('403 billing not enabled'));
+      assert.equal(billingErr.category, 'paid_tier_required');
+
+      // 6. Verify Nano Banana marketing visual asset generation
+      const fakeImageClient: any = {
+        models: {
+          generateContent: async (params: any) => {
+            assert.equal(params.model, DEFAULT_GOOGLE_IMAGE_MODEL_ID);
+            assert.equal(params.config?.imageConfig?.aspectRatio, '9:16');
+            return {
+              candidates: [
+                {
+                  content: {
+                    parts: [
+                      {
+                        inlineData: {
+                          mimeType: 'image/png',
+                          data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            };
+          },
+        },
+      };
+
+      const visualAsset = await generateNanoBananaVisualAsset({
+        prompt: '9:16 cinematic product hero frame with dramatic rim light',
+        aspectRatio: '9:16',
+        client: fakeImageClient,
+      });
+
+      assert.equal(visualAsset.aspectRatio, '9:16');
+      assert.equal(visualAsset.modelUsed, DEFAULT_GOOGLE_IMAGE_MODEL_ID);
+      assert.match(visualAsset.imageDataUrl, /^data:image\/png;base64,/);
+
+      // 7. Verify legacy campaign backward compatibility normalization
+      assert.equal(normalizeRenderEnginePreference('ai_video_cosmos_nano'), 'ai_video_google_veo');
+      assert.equal(normalizeRenderEnginePreference('ai_video_omni'), 'ai_video_google_veo');
+      assert.equal(normalizeRenderEnginePreference('ai_video_runway'), 'ai_video_google_veo');
+      assert.equal(normalizeRenderEnginePreference('basic_slideshow_ffmpeg'), 'basic_slideshow_ffmpeg');
+
+      const testCampaign: Campaign = {
+        id: 'camp_veo_provider_test',
+        createdAt: '2026-11-04T00:00:00.000Z',
+        updatedAt: '2026-11-04T00:05:00.000Z',
+        status: 'audio_ready',
+        title: 'Veloce Barista Pro',
+        price: '$649',
+        brandName: 'Veloce Milano',
+        brandVoice: 'Luxury',
+        targetAudience: 'Inferred: Coffee lovers',
+        visualStyle: 'Studio lighting',
+        imageDataUrl:
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        analysisMetadata: {
+          requestedModel: 'gemini-3.1-flash-lite',
+          resolvedModel: 'gemini-3.1-flash-lite',
+          fallbackUsed: false,
+          latencyMs: 200,
+          analyzedAt: '2026-11-04T00:00:00.000Z',
+        },
+        productProfile: {
+          detectedProductName: 'Veloce Barista Pro',
+          category: 'Appliances',
+          subcategory: 'Espresso',
+          productSummary: 'Espresso machine.',
+          dominantColors: [{ name: 'Obsidian', hex: '#1C1917', usageRole: 'Body' }],
+          materialsAndTextures: ['Steel'],
+          estimatedDimensions: '30cm',
+          detectedFeatures: ['9-bar gauge'],
+          keySellingPoints: [],
+          brandVoiceGuidelines: {
+            toneDescriptors: ['Refined'],
+            wordsToUse: ['crema'],
+            wordsToAvoid: ['cheap'],
+            targetPersonaSummary: 'Inferred: Coffee lovers',
+          },
+          recommendedAdAngles: [],
+          visualFidelityConstraints: ['Preserve gauge'],
+        },
+        storyboard: {
+          conceptTitle: '9-Bar Ritual',
+          targetPlatformFormat: 'Instagram Reels (9:16)',
+          totalDurationSeconds: 3,
+          openingHook3s: 'Stop settling for bitter coffee.',
+          fullVoiceoverScript: 'Stop settling for bitter coffee. Experience Veloce.',
+          estimatedWordCount: 7,
+          brandSafetyVerification: ['Verified'],
+          masterCinematicPrompt9x16: 'Vertical 9:16 commercial.',
+          musicDirectionPrompt: 'Acoustic',
+          shots: [
+            {
+              shotNumber: 1,
+              durationSeconds: 3,
+              timecodeRange: '00:00 - 00:03',
+              shotType: '01. Hero',
+              sceneDescription: 'Brass gauge rising.',
+              cameraMovement: 'Orbit',
+              visualPrompt9x16: '9:16 orbit',
+              onScreenTextOverlay: 'Veloce Barista Pro',
+              spokenVoiceoverSegment: 'Stop settling for bitter coffee. Experience Veloce.',
+              productFidelityNote: 'Preserve brass dial.',
+            },
+          ],
+          generationMetadata: {
+            requestedModel: 'gemini-3.1-flash-lite',
+            resolvedModel: 'gemini-3.1-flash-lite',
+            fallbackUsed: false,
+            latencyMs: 300,
+            generatedAt: '2026-11-04T00:02:00.000Z',
+          },
+        },
+        voiceover: {
+          id: 'vo_veo_provider_test',
+          voiceName: 'Kore',
+          voiceStyle: 'Warm',
+          scriptTextUsed: 'Stop settling for bitter coffee. Experience Veloce.',
+          audioFileUrl: `/api/audio/${voFilename}`,
+          mimeType: 'audio/wav',
+          byteLength: wav3s.length,
+          sampleRateHz: 24000,
+          durationEstimateSeconds: 3.0,
+          resolvedModel: PRIMARY_TTS_MODEL,
+          latencyMs: 400,
+          generatedAt: '2026-11-04T00:03:00.000Z',
+        },
+      };
+
+      const legacyCampaignWithCosmos = {
+        ...testCampaign,
+        latestCompletedRender: {
+          id: 'job_legacy_cosmos',
+          campaignId: testCampaign.id,
+          versionNumber: 1,
+          status: 'completed' as const,
+          progressPercent: 100,
+          stageMessage: 'Done',
+          aspectRatio: '9:16' as const,
+          resolution: '1080x1920' as const,
+          width: 1080,
+          height: 1920,
+          fps: 24,
+          targetDurationSeconds: 3,
+          durationSeconds: 3,
+          requestedEngine: 'ai_video_cosmos_nano' as unknown as import('../src/types.ts').RenderEnginePreference,
+          providerUsed: 'cosmos_nano' as unknown as import('../src/types.ts').AiVideoProviderId,
+          engineUsed: 'cosmos_nano_video' as unknown as import('../src/types.ts').RenderEngineUsed,
+          engineLabel: 'NVIDIA Cosmos 3 Nano',
+          isAiVideoGenerated: true,
+          includeSubtitles: true,
+          audioModeSummary: 'WAV',
+          contentFingerprint: 'fp_123',
+          createdAt: '2026-11-04T00:00:00.000Z',
+          updatedAt: '2026-11-04T00:01:00.000Z',
+        },
+      };
+
+      const normalizedLegacy = normalizeLegacyCampaignVideoFields(legacyCampaignWithCosmos);
+      assert.equal(
+        normalizedLegacy.latestCompletedRender?.requestedEngine,
+        'ai_video_google_veo'
+      );
+      assert.equal(normalizedLegacy.latestCompletedRender?.providerUsed, 'google_veo');
+      assert.equal(normalizedLegacy.latestCompletedRender?.engineUsed, 'google_veo_video');
+
+      // 8. Verify invalid/non-video provider response (PNG instead of MP4) is rejected with invalid_video_output
+      const pngBytes = Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        'base64'
+      );
+      let invalidPayloadErr: unknown = null;
+      try {
+        await renderCampaignVerticalVideo({
+          campaign: testCampaign,
+          settings: {
+            resolution: '720x1280',
+            includeSubtitles: true,
+            enginePreference: 'ai_video_google_veo',
+          },
+          jobId: 'job_invalid_png',
+          audioDir,
+          videosDir,
+          omniShotGenerator: async () => ({
+            videoBuffer: pngBytes,
+            modelUsed: 'veo-2.0-generate-001',
+          }),
+        });
+      } catch (err) {
+        invalidPayloadErr = err;
+      }
+
+      assert.ok(invalidPayloadErr instanceof VideoRenderError);
+      const vErr = invalidPayloadErr as InstanceType<typeof VideoRenderError>;
+      assert.equal(vErr.failureCategory, 'invalid_video_output');
+      assert.equal(vErr.providerUsed, 'google_veo');
+      assert.equal(vErr.isAiVideoGenerated, false);
+
+      // 9. Verify full end-to-end Google Veo 2.0 render pipeline produces a 1080x1920 9:16 MP4 with providerUsed='google_veo'
+      const fullVeoRender = await renderCampaignVerticalVideo({
+        campaign: testCampaign,
+        settings: {
+          resolution: '1080x1920',
+          includeSubtitles: true,
+          enginePreference: 'ai_video_google_veo',
+        },
+        jobId: 'job_veo_ok',
+        audioDir,
+        videosDir,
+        omniShotGenerator: async () => ({
+          videoBuffer: sampleProviderMp4Buffer,
+          modelUsed: 'veo-2.0-generate-001',
+        }),
+      });
+
+      assert.equal(fullVeoRender.isAiVideoGenerated, true);
+      assert.equal(fullVeoRender.providerUsed, 'google_veo');
+      assert.equal(fullVeoRender.modelUsed, 'veo-2.0-generate-001');
+      assert.equal(fullVeoRender.engineUsed, 'google_veo_video');
+      assert.equal(fullVeoRender.width, 1080);
+      assert.equal(fullVeoRender.height, 1920);
+      const probed = await probeRenderedVideoFile(fullVeoRender.outputFilePath);
+      assert.equal(probed.width, 1080);
+      assert.equal(probed.height, 1920);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });
+
+
+
 
 
 

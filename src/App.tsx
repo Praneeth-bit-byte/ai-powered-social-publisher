@@ -36,6 +36,8 @@ import type {
   ProductProfile,
   StoryboardShot,
   ModelVerificationReport,
+  RenderEnginePreference,
+  VideoProviderStatusInfo,
 } from './types.ts';
 import { SAMPLE_PRODUCT_PRESETS, type SampleProductPreset } from './utils/sampleProducts.ts';
 import {
@@ -47,6 +49,8 @@ import {
 import {
   checkCampaignRenderReadiness,
   computeCampaignContentFingerprint,
+  getEngineDisplayMetadata,
+  isAiVideoEnginePreference,
 } from './utils/milestone3Validators.ts';
 import {
   createBlankStudioState,
@@ -81,46 +85,47 @@ const PLATFORM_FORMATS = [
 const MILESTONE_ROADMAP = [
   {
     number: '01',
-    title: 'Project Scaffold, Studio Layout & Multimodal Product Analysis',
+    title: 'Project Scaffold, Studio Layout & Multimodal Product Analysis (Nemotron)',
     status: 'Completed & Verified',
     active: true,
     completed: true,
     summary:
-      'Upload product photos or load studio presets, configure brand voice and audience, run server-side Gemini multimodal vision analysis, and inspect/edit the structured JSON Product Profile.',
+      'Upload product photos or load studio presets, configure brand voice and audience, run server-side NVIDIA Nemotron 3.5 Super VL multimodal vision analysis, and inspect/edit the structured JSON Product Profile.',
     deliverables: [
       'Full-stack Express + Vite + React + TypeScript server on port 3000',
-      'Server-side @google/genai multimodal vision extraction with strict JSON schema',
-      'Live Gemini model availability & fallback verification probe',
+      'Server-side NVIDIA Nemotron 3.5 Super VL multimodal vision extraction with strict JSON schema',
+      'Live NVIDIA Nemotron & Media model availability & fallback verification probe',
       'Interactive Visual Profile Editor + Raw JSON Schema Inspector with persistent server storage',
     ],
   },
   {
     number: '02',
-    title: 'AI Script, Shot-by-Shot Storyboard & Voiceover/Music Synthesis',
+    title: 'AI Script, Shot-by-Shot Storyboard (Nemotron) & Audio Synthesis',
     status: 'Completed & Verified',
     active: true,
     completed: true,
     summary:
-      'Generate brand-safe cinematic 9:16 video concepts, 15–30s voiceover scripts, shot-by-shot storyboards with editable scenes/prompts, and real 24kHz WAV voiceovers using gemini-3.8-flash-lite-tts.',
+      'Generate brand-safe cinematic 9:16 video concepts, 15–30s voiceover scripts, shot-by-shot storyboards with editable scenes/prompts via NVIDIA Llama 3.1 Nemotron 70B, and real 24kHz WAV voiceovers using gemini-3.8-flash-lite-tts.',
     deliverables: [
-      'Brand-safe 9:16 video concept, 3-second hook, and spoken voiceover script generator',
-      'Editable shot-by-shot 9:16 storyboard with automatic timecode recalculation',
+      'Brand-safe 9:16 video concept, 3-second hook, and voiceover script via NVIDIA Llama 3.1 Nemotron 70B',
+      'Editable shot-by-shot 9:16 storyboard with automatic timecode recalculation and cinematic visual prompts',
       'Real 24kHz WAV AI voiceover synthesis (Kore, Puck, Charon, Fenrir, Zephyr) + Studio Audio Player',
       'Honest Background Music workflow (live Lyria probe, custom MP3/WAV upload, or Voiceover-Only placeholder)',
     ],
   },
   {
     number: '03',
-    title: '9:16 Video Ad Rendering, Motion Compositor & Approval Gate',
+    title: 'Per-Shot 9:16 AI Video Generation (Google Veo 2.0) & Approval Gate',
     status: 'Active · Ready for Testing',
     active: true,
     completed: false,
     summary:
-      'Render genuine vertical 9:16 MP4 ads (1080×1920) combining the actual product image, storyboard shot cards, burned-in subtitles, 24kHz WAV voiceover, and optional background music with an explicit Preview & Approval Gate.',
+      'Generate per-shot animated 9:16 commercial clips via Google Veo 2.0 (veo-2.0-generate-001) using the official @google/genai SDK (or explicitly select Basic Motion/Slideshow Render), generate marketing visuals with Nano Banana, stitch with 24kHz WAV voiceover and music, and review in the Human Approval Gate.',
     deliverables: [
-      'Genuine 9:16 vertical H.264/AAC MP4 renderer (1080×1920) with product-preserving shot cards & subtitles',
-      'Transparent engine labeling (Gemini Omni 1.1 Flash probe + FFmpeg 9:16 Motion-Compositor fallback)',
-      'Playable 9:16 MP4 preview, Approve/Reject/Render Again gate, and automatic invalidation on edits',
+      'Per-shot 9:16 AI video generation via Google Veo 2.0 (veo-2.0-generate-001) with product image reference',
+      'Nano Banana image generation (gemini-3.1-flash-lite-image) for campaign visuals, frames, and thumbnails',
+      'Strict separation between AI Video Generation and Basic Motion/Slideshow Render (never silently substituted)',
+      'Per-shot progress tracking, request timeouts, retry of failed shots, render cancellation, clip validation, and Human Approval Gate',
     ],
   },
   {
@@ -194,7 +199,9 @@ export default function App() {
 
   // Live Gemini Model Readiness Verification state
   const [modelReport, setModelReport] = useState<ModelVerificationReport | null>(null);
+  const [videoProviders, setVideoProviders] = useState<VideoProviderStatusInfo[]>([]);
   const [isVerifyingModels, setIsVerifyingModels] = useState<boolean>(false);
+  const [generatingVisualAssetIndex, setGeneratingVisualAssetIndex] = useState<number | null>(null);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -210,6 +217,7 @@ export default function App() {
     // while keeping the active Product Studio completely blank on initial load/reload.
     fetchCampaigns();
     runModelVerification();
+    fetchVideoProviders();
   }, []);
 
   const resetAudioPlayer = () => {
@@ -312,9 +320,23 @@ export default function App() {
     }
   };
 
+  const fetchVideoProviders = async () => {
+    try {
+      const res = await fetch('/api/video-providers');
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.providers)) {
+        setVideoProviders(data.providers);
+      }
+    } catch {
+      // Ignore provider status probe errors
+    }
+  };
+
   const runModelVerification = async () => {
     setIsVerifyingModels(true);
     try {
+      fetchVideoProviders();
       const res = await fetch('/api/system/verify-models');
       if (!res.ok) throw new Error('Failed to verify Gemini models.');
       const report: ModelVerificationReport = await res.json();
@@ -410,7 +432,7 @@ export default function App() {
       isAnalyzing: true,
       lastRetryAction: null,
       errorBanner: null,
-      statusMessage: 'Analyzing product image with Gemini Vision...',
+      statusMessage: 'Analyzing product image with NVIDIA Nemotron Vision...',
     }));
 
     const { state: analyzedState, campaign } = await analyzeUploadedImageWithGemini(
@@ -647,6 +669,45 @@ export default function App() {
     }
   };
 
+  const handleGenerateVisualAsset = async (prompt: string, shotIndex?: number) => {
+    const { activeCampaign } = studio;
+    if (!activeCampaign) return;
+    setGeneratingVisualAssetIndex(shotIndex ?? 999);
+    setStudio((prev) => ({
+      ...prev,
+      statusMessage: `Generating 9:16 visual asset with Nano Banana (gemini-3.1-flash-lite-image)...`,
+      errorBanner: null,
+    }));
+
+    try {
+      const res = await fetch(`/api/campaigns/${activeCampaign.id}/visual-assets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt, aspectRatio: '9:16' }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to generate visual asset.');
+      }
+      const updated: Campaign = data.campaign;
+      setCampaigns((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+      setStudio((prev) => ({
+        ...prev,
+        activeCampaign: updated,
+        statusMessage: `Generated 9:16 visual asset with Nano Banana (${data.visualAsset.modelUsed}).`,
+      }));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setStudio((prev) => ({
+        ...prev,
+        errorBanner: msg,
+        statusMessage: null,
+      }));
+    } finally {
+      setGeneratingVisualAssetIndex(null);
+    }
+  };
+
   const handleUpdateShotField = (
     shotIndex: number,
     field: keyof StoryboardShot,
@@ -839,10 +900,16 @@ export default function App() {
     }
   };
 
-  // MILESTONE 3 HANDLER: Render 9:16 Vertical MP4 Video
-  const handleRenderVideo = async () => {
+  // MILESTONE 3 HANDLER: Render 9:16 Vertical MP4 Video (AI Video or Basic Slideshow)
+  const handleRenderVideo = async (options?: {
+    retryFailedShotsOnly?: boolean;
+    overrideEnginePreference?: import('./types.ts').RenderEnginePreference;
+  }) => {
     const { activeCampaign, editableStoryboard, renderSettings } = studio;
     if (!activeCampaign) return;
+
+    const chosenEngine = options?.overrideEnginePreference || renderSettings.enginePreference;
+    const retryFailedShotsOnly = Boolean(options?.retryFailedShotsOnly);
 
     const readiness = checkCampaignRenderReadiness({
       ...activeCampaign,
@@ -858,13 +925,22 @@ export default function App() {
       return;
     }
 
+    const engineMeta = getEngineDisplayMetadata(chosenEngine);
     setStudio((prev) => ({
       ...prev,
+      renderSettings: {
+        ...prev.renderSettings,
+        enginePreference: chosenEngine,
+      },
       isRenderingVideo: true,
       lastRetryAction: null,
       errorBanner: null,
       warningBanner: null,
-      statusMessage: 'Starting 9:16 vertical MP4 render job...',
+      statusMessage: isAiVideoEnginePreference(chosenEngine)
+        ? retryFailedShotsOnly
+          ? `Retrying failed AI video shots via ${engineMeta.engineLabel} (reusing completed shots)...`
+          : `Starting per-shot 9:16 AI video generation via ${engineMeta.engineLabel}...`
+        : 'Starting Basic Motion/Slideshow 9:16 MP4 render...',
     }));
 
     let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -898,14 +974,21 @@ export default function App() {
         body: JSON.stringify({
           resolution: renderSettings.resolution,
           includeSubtitles: renderSettings.includeSubtitles,
-          enginePreference: renderSettings.enginePreference,
+          enginePreference: chosenEngine,
           revisionNote: renderSettings.revisionNote,
+          retryFailedShotsOnly,
           ...(editableStoryboard ? { storyboard: editableStoryboard } : {}),
         }),
       });
 
       const data = await res.json();
       if (!res.ok) {
+        if (data.campaign) {
+          const failedCamp: Campaign = data.campaign;
+          setCampaigns((prev) => prev.map((c) => (c.id === failedCamp.id ? failedCamp : c)));
+          setStudio((prev) => handleRenderErrorState(prev, data.error || '9:16 video rendering failed.', failedCamp));
+          return;
+        }
         throw new Error(data.error || '9:16 video rendering failed.');
       }
 
@@ -915,6 +998,7 @@ export default function App() {
         const nextState = applyCampaignToStudioState(updated);
         nextState.renderSettings = {
           ...prev.renderSettings,
+          enginePreference: chosenEngine,
           revisionNote: '',
         };
         nextState.isRenderingVideo = false;
@@ -931,6 +1015,35 @@ export default function App() {
       if (pollTimer) {
         clearInterval(pollTimer);
       }
+    }
+  };
+
+  // MILESTONE 3 HANDLER: Cancel Active Video Render Job
+  const handleCancelRenderJob = async () => {
+    const { activeCampaign } = studio;
+    if (!activeCampaign) return;
+    try {
+      const res = await fetch(`/api/campaigns/${activeCampaign.id}/render-cancel`, {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (data.campaign) {
+        const updated: Campaign = data.campaign;
+        setCampaigns((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+        setStudio((prev) => ({
+          ...prev,
+          activeCampaign: updated,
+          isRenderingVideo: false,
+          statusMessage: null,
+          warningBanner: 'Video render job was cancelled.',
+        }));
+      }
+    } catch (err: unknown) {
+      setStudio((prev) => ({
+        ...prev,
+        isRenderingVideo: false,
+        errorBanner: err instanceof Error ? err.message : 'Failed to cancel render job.',
+      }));
     }
   };
 
@@ -2830,10 +2943,63 @@ export default function App() {
                                   className="w-full px-2.5 py-1.5 text-xs rounded border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950"
                                 />
                               </div>
+
+                              <div className="pt-2 flex items-center justify-between border-t border-slate-100 dark:border-slate-800/80">
+                                <button
+                                  type="button"
+                                  disabled={generatingVisualAssetIndex !== null || !studio.activeCampaign}
+                                  onClick={() => handleGenerateVisualAsset(shot.visualPrompt9x16, idx)}
+                                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded border border-orange-300 dark:border-orange-800 text-orange-700 dark:text-orange-300 bg-orange-50/70 dark:bg-orange-950/40 hover:bg-orange-100 dark:hover:bg-orange-900/40 transition-colors disabled:opacity-50"
+                                >
+                                  {generatingVisualAssetIndex === idx ? (
+                                    <RefreshCw className="w-3 h-3 animate-spin" />
+                                  ) : (
+                                    <Sparkles className="w-3 h-3 text-orange-500" />
+                                  )}
+                                  Generate 9:16 Visual Asset (Nano Banana)
+                                </button>
+                              </div>
                             </div>
                           ))}
                         </div>
                       </div>
+
+                      {studio.activeCampaign?.visualAssets && studio.activeCampaign.visualAssets.length > 0 && (
+                        <div className="p-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm">
+                          <div className="flex items-center justify-between mb-3">
+                            <div>
+                              <h3 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                                Generated Nano Banana Visual Assets ({studio.activeCampaign.visualAssets.length})
+                              </h3>
+                              <p className="text-xs text-slate-500 dark:text-slate-400">
+                                Marketing visuals & storyboard frames generated via gemini-3.1-flash-lite-image
+                              </p>
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                            {studio.activeCampaign.visualAssets.map((asset) => (
+                              <div
+                                key={asset.id}
+                                className="rounded-lg border border-slate-200 dark:border-slate-800 overflow-hidden bg-slate-50 dark:bg-slate-950"
+                              >
+                                <div className="aspect-[9/16] bg-slate-900 relative">
+                                  <img
+                                    src={asset.imageDataUrl}
+                                    alt={asset.promptUsed}
+                                    className="w-full h-full object-cover"
+                                  />
+                                </div>
+                                <div className="p-2 text-[10px] space-y-1">
+                                  <div className="font-mono text-slate-400 truncate">{asset.modelUsed}</div>
+                                  <p className="text-slate-600 dark:text-slate-300 line-clamp-2 leading-tight">
+                                    {asset.promptUsed}
+                                  </p>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </>
@@ -3402,33 +3568,82 @@ export default function App() {
 
                         <div>
                           <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                            Video Rendering Engine
+                            Video Rendering Mode & AI Video Provider (Strictly Separated)
                           </label>
                           <select
-                            value={renderSettings.enginePreference}
+                            value={
+                              renderSettings.enginePreference === 'ffmpeg_motion_compositor' ||
+                              renderSettings.enginePreference === 'basic_slideshow_ffmpeg'
+                                ? 'basic_slideshow_ffmpeg'
+                                : 'ai_video_google_veo'
+                            }
                             onChange={(e) =>
                               setStudio((prev) => ({
                                 ...prev,
                                 renderSettings: {
                                   ...prev.renderSettings,
-                                  enginePreference: e.target.value as
-                                    | 'ffmpeg_motion_compositor'
-                                    | 'auto_omni_with_ffmpeg_fallback',
+                                  enginePreference: e.target.value as RenderEnginePreference,
                                 },
                               }))
                             }
-                            className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950"
+                            className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 font-medium"
                           >
-                            <option value="ffmpeg_motion_compositor">
-                              FFmpeg 9:16 Motion-Compositor (Verified Local H.264 Renderer)
-                            </option>
-                            <option value="auto_omni_with_ffmpeg_fallback">
-                              Attempt Gemini Omni 1.1 Flash (Paid Tier) + FFmpeg 9:16 Fallback
-                            </option>
+                            <optgroup label="Genuine Per-Shot 9:16 AI Video Generation (Google Veo 2.0)">
+                              <option value="ai_video_google_veo">
+                                Google Veo 2.0 (veo-2.0-generate-001 · Per-Shot 9:16 AI Video)
+                              </option>
+                            </optgroup>
+                            <optgroup label="Explicit Non-AI Fallback Mode">
+                              <option value="basic_slideshow_ffmpeg">
+                                Basic Motion/Slideshow Render — FFmpeg Static Product Cards (Not AI Video)
+                              </option>
+                            </optgroup>
                           </select>
-                          <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                            The FFmpeg 9:16 Motion-Compositor renders your actual product image, storyboard shot cards, and burned-in captions synchronized to the 24kHz WAV voiceover. It is clearly labeled and never misrepresented as generative AI video.
-                          </p>
+                          {isAiVideoEnginePreference(renderSettings.enginePreference) ? (
+                            <div className="mt-2 p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 space-y-1.5 text-[11px] text-slate-600 dark:text-slate-400">
+                              <p className="leading-relaxed">
+                                <strong>Genuine AI Video Generation Mode (Google Veo 2.0):</strong> Generates per-shot animated 9:16 vertical video clips with cinematic camera movement and product fidelity via Google Veo 2.0 (`veo-2.0-generate-001`) using the official @google/genai SDK.{' '}
+                                <strong>Never silently falls back to the static FFmpeg slideshow.</strong>
+                              </p>
+                              {videoProviders.length > 0 && (
+                                <div className="pt-1 border-t border-slate-200 dark:border-slate-800 space-y-1.5">
+                                  <div className="font-semibold text-slate-700 dark:text-slate-300">
+                                    Google AI Video Model Status:
+                                  </div>
+                                  {videoProviders.map((prov) => (
+                                    <div
+                                      key={prov.providerId}
+                                      className="space-y-1"
+                                    >
+                                      <div className="flex items-center justify-between gap-2 font-mono text-[10px]">
+                                        <span className="truncate">
+                                          {prov.providerName} ({prov.defaultModelId}) · {prov.envVarName}
+                                        </span>
+                                        <span
+                                          className={`px-1.5 py-0.5 rounded font-semibold shrink-0 ${
+                                            prov.configured
+                                              ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                              : 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+                                          }`}
+                                        >
+                                          {prov.configured
+                                            ? 'API KEY CONFIGURED'
+                                            : 'API KEY NOT SET'}
+                                        </span>
+                                      </div>
+                                      <div className="text-[10px] text-slate-500 dark:text-slate-400 leading-snug">
+                                        {prov.statusSummary}
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <p className="text-[11px] text-amber-700 dark:text-amber-300 mt-1.5 leading-relaxed">
+                              <strong>Basic Motion/Slideshow Mode (Non-AI Fallback):</strong> Composites static product cards and burned-in captions locally using FFmpeg. Explicitly labeled as a non-AI slideshow preview.
+                            </p>
+                          )}
                         </div>
 
                         <div className="flex items-center justify-between p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60">
@@ -3478,25 +3693,27 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Active Render Job Progress Indicator */}
+                      {/* Active Render Job Progress & Cancellation */}
                       {(isRenderingVideo ||
                         activeCampaign.activeRenderJob?.status === 'queued' ||
-                        activeCampaign.activeRenderJob?.status === 'processing') && (
+                        activeCampaign.activeRenderJob?.status === 'processing' ||
+                        activeCampaign.activeRenderJob?.status === 'generating' ||
+                        activeCampaign.activeRenderJob?.status === 'stitching') && (
                         <div
                           role="status"
                           aria-live="polite"
-                          className="p-4 rounded-lg border border-orange-500/40 bg-orange-500/10 space-y-2.5"
+                          className="p-4 rounded-lg border border-orange-500/40 bg-orange-500/10 space-y-3"
                         >
-                          <div className="flex items-center justify-between text-xs font-semibold text-slate-900 dark:text-slate-100">
+                          <div className="flex items-center justify-between gap-2 text-xs font-semibold text-slate-900 dark:text-slate-100">
                             <span className="inline-flex items-center gap-2">
-                              <RefreshCw className="w-3.5 h-3.5 animate-spin text-orange-600 dark:text-orange-400" />
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin text-orange-600 dark:text-orange-400 shrink-0" />
                               <span>
                                 {activeCampaign.activeRenderJob?.stageMessage ||
-                                  'Rendering 9:16 vertical MP4 shots & mixing audio...'}
+                                  'Generating 9:16 vertical MP4 shots & mixing audio...'}
                               </span>
                             </span>
-                            <span className="font-mono tabular-nums">
-                              {activeCampaign.activeRenderJob?.progressPercent || 25}%
+                            <span className="font-mono tabular-nums shrink-0">
+                              {activeCampaign.activeRenderJob?.progressPercent || 15}%
                             </span>
                           </div>
                           <div className="w-full h-2 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
@@ -3504,41 +3721,231 @@ export default function App() {
                               className="h-full bg-orange-600 transition-all duration-300"
                               style={{
                                 width: `${Math.max(
-                                  12,
-                                  activeCampaign.activeRenderJob?.progressPercent || 25
+                                  10,
+                                  activeCampaign.activeRenderJob?.progressPercent || 15
                                 )}%`,
                               }}
                             />
                           </div>
+                          <div className="flex justify-end">
+                            <button
+                              type="button"
+                              onClick={handleCancelRenderJob}
+                              className="px-3 py-1 rounded-md border border-red-400 dark:border-red-800 text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/50 text-[11px] font-semibold inline-flex items-center gap-1"
+                            >
+                              <XCircle className="w-3 h-3" />
+                              <span>Cancel Render Job</span>
+                            </button>
+                          </div>
                         </div>
                       )}
 
-                      <button
-                        type="button"
-                        onClick={handleRenderVideo}
-                        disabled={
-                          isRenderingVideo ||
-                          activeCampaign.activeRenderJob?.status === 'queued' ||
-                          activeCampaign.activeRenderJob?.status === 'processing'
-                        }
-                        className="w-full py-2.5 px-4 rounded-lg bg-orange-600 hover:bg-orange-500 disabled:opacity-60 text-white text-sm font-semibold transition-colors inline-flex items-center justify-center gap-2 whitespace-nowrap"
-                      >
-                        {isRenderingVideo ? (
-                          <>
-                            <RefreshCw className="w-4 h-4 animate-spin" />
-                            <span>Rendering 9:16 Vertical MP4...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Video className="w-4 h-4" />
+                      {/* Honest Provider / Paid-Tier / Quota Failure Callout (Never Silently Substitutes Slideshow) */}
+                      {activeCampaign.activeRenderJob?.status === 'failed' && (
+                        <div className="p-4 rounded-lg border border-red-300 dark:border-red-900/80 bg-red-50/90 dark:bg-red-950/40 text-xs space-y-3">
+                          <div className="font-bold text-red-900 dark:text-red-200 flex items-center gap-1.5">
+                            <AlertTriangle className="w-4 h-4 text-red-600 dark:text-red-400 shrink-0" />
                             <span>
-                              {activeCampaign.latestCompletedRender
-                                ? 'Render Again (New 9:16 MP4 Version)'
-                                : 'Render 9:16 Vertical Video (.MP4)'}
+                              {activeCampaign.activeRenderJob.failureCategory === 'paid_tier_required'
+                                ? 'AI Video Generation Blocked: Paid Tier / Billing Required'
+                                : activeCampaign.activeRenderJob.failureCategory === 'auth_or_missing_key'
+                                ? 'AI Video Provider Authentication / Missing API Key'
+                                : activeCampaign.activeRenderJob.failureCategory === 'quota_exceeded'
+                                ? 'AI Video Generation Rate Limit / Quota Exceeded (HTTP 429)'
+                                : activeCampaign.activeRenderJob.failureCategory === 'invalid_video_output'
+                                ? 'AI Video Provider Returned Invalid Video Output'
+                                : 'Video Render Job Failed'}
                             </span>
-                          </>
-                        )}
-                      </button>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] text-red-700 dark:text-red-300">
+                            {activeCampaign.activeRenderJob.providerUsed && (
+                              <span className="px-1.5 py-0.5 rounded bg-red-500/15">
+                                Provider: {activeCampaign.activeRenderJob.providerUsed}
+                              </span>
+                            )}
+                            {activeCampaign.activeRenderJob.modelUsed && (
+                              <span className="px-1.5 py-0.5 rounded bg-red-500/15">
+                                Model: {activeCampaign.activeRenderJob.modelUsed}
+                              </span>
+                            )}
+                            {activeCampaign.activeRenderJob.failureCategory && (
+                              <span className="px-1.5 py-0.5 rounded bg-red-500/15">
+                                Category: {activeCampaign.activeRenderJob.failureCategory}
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-red-800 dark:text-red-300 leading-relaxed">
+                            {activeCampaign.activeRenderJob.errorMessage}
+                          </p>
+                          <div className="flex flex-wrap items-center gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => handleRenderVideo({ retryFailedShotsOnly: false })}
+                              disabled={isRenderingVideo}
+                              className="px-3 py-1.5 rounded-md bg-orange-600 hover:bg-orange-500 text-white font-semibold inline-flex items-center gap-1.5"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                              <span>Retry AI Video Render</span>
+                            </button>
+                            {activeCampaign.activeRenderJob.shotResults?.some(
+                              (s) => s.status === 'completed'
+                            ) &&
+                              activeCampaign.activeRenderJob.shotResults?.some(
+                                (s) => s.status === 'failed'
+                              ) && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleRenderVideo({ retryFailedShotsOnly: true })}
+                                  disabled={isRenderingVideo}
+                                  className="px-3 py-1.5 rounded-md bg-slate-900 dark:bg-white text-white dark:text-slate-900 font-semibold inline-flex items-center gap-1.5"
+                                >
+                                  <RotateCcw className="w-3.5 h-3.5" />
+                                  <span>Retry Failed Shots Only</span>
+                                </button>
+                              )}
+                            {isAiVideoEnginePreference(renderSettings.enginePreference) && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleRenderVideo({
+                                    overrideEnginePreference: 'basic_slideshow_ffmpeg',
+                                  })
+                                }
+                                disabled={isRenderingVideo}
+                                className="px-3 py-1.5 rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 font-semibold hover:bg-slate-100 dark:hover:bg-slate-800"
+                              >
+                                Switch to Basic Motion/Slideshow Render (Non-AI)
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="flex flex-col gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleRenderVideo({ retryFailedShotsOnly: false })}
+                          disabled={
+                            isRenderingVideo ||
+                            activeCampaign.activeRenderJob?.status === 'queued' ||
+                            activeCampaign.activeRenderJob?.status === 'processing' ||
+                            activeCampaign.activeRenderJob?.status === 'generating' ||
+                            activeCampaign.activeRenderJob?.status === 'stitching'
+                          }
+                          className="w-full py-2.5 px-4 rounded-lg bg-orange-600 hover:bg-orange-500 disabled:opacity-60 text-white text-sm font-semibold transition-colors inline-flex items-center justify-center gap-2 whitespace-nowrap"
+                        >
+                          {isRenderingVideo ? (
+                            <>
+                              <RefreshCw className="w-4 h-4 animate-spin" />
+                              <span>
+                                {isAiVideoEnginePreference(renderSettings.enginePreference)
+                                  ? 'Generating Per-Shot 9:16 AI Video...'
+                                  : 'Rendering Basic Motion/Slideshow MP4...'}
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <Video className="w-4 h-4" />
+                              <span>
+                                {isAiVideoEnginePreference(renderSettings.enginePreference)
+                                  ? activeCampaign.latestCompletedRender
+                                    ? 'Generate New 9:16 AI Video Version'
+                                    : 'Generate 9:16 AI Video Ad (Per-Shot Provider)'
+                                  : activeCampaign.latestCompletedRender
+                                  ? 'Render New Basic Motion/Slideshow Version (.MP4)'
+                                  : 'Render Basic Motion/Slideshow Preview (.MP4)'}
+                              </span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+
+                      {/* Per-Shot Generation Progress & Clip Inspector */}
+                      {(activeCampaign.activeRenderJob?.shotResults ||
+                        activeCampaign.latestCompletedRender?.shotResults) && (
+                        <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-2.5">
+                          <div className="flex items-center justify-between">
+                            <h3 className="font-display text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300">
+                              Per-Shot Render Status (
+                              {
+                                (
+                                  activeCampaign.activeRenderJob?.shotResults ||
+                                  activeCampaign.latestCompletedRender?.shotResults ||
+                                  []
+                                ).filter((s) => s.status === 'completed').length
+                              }
+                              /
+                              {
+                                (
+                                  activeCampaign.activeRenderJob?.shotResults ||
+                                  activeCampaign.latestCompletedRender?.shotResults ||
+                                  []
+                                ).length
+                              }{' '}
+                              Completed)
+                            </h3>
+                          </div>
+                          <div className="space-y-2 max-h-64 overflow-y-auto">
+                            {(
+                              activeCampaign.activeRenderJob?.shotResults ||
+                              activeCampaign.latestCompletedRender?.shotResults ||
+                              []
+                            ).map((shotState) => (
+                              <div
+                                key={shotState.shotNumber}
+                                className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 text-xs space-y-1"
+                              >
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                    Shot 0{shotState.shotNumber} · {shotState.shotType} (
+                                    {shotState.durationSeconds}s)
+                                  </div>
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    <span
+                                      className={`font-mono text-[10px] font-semibold uppercase px-1.5 py-0.5 rounded ${
+                                        shotState.status === 'completed'
+                                          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                                          : shotState.status === 'generating'
+                                          ? 'bg-orange-500/15 text-orange-700 dark:text-orange-300'
+                                          : shotState.status === 'failed'
+                                          ? 'bg-red-500/15 text-red-700 dark:text-red-300'
+                                          : 'bg-slate-500/15 text-slate-600 dark:text-slate-400'
+                                      }`}
+                                    >
+                                      {shotState.status}
+                                    </span>
+                                    {shotState.clipFileUrl && (
+                                      <a
+                                        href={shotState.clipFileUrl}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="font-mono text-[10px] text-orange-600 dark:text-orange-400 underline"
+                                      >
+                                        Clip .MP4
+                                      </a>
+                                    )}
+                                  </div>
+                                </div>
+                                {(shotState.providerUsed || shotState.modelUsed) && (
+                                  <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                                    Provider: {shotState.providerUsed || 'google_veo'} · Model:{' '}
+                                    {shotState.modelUsed || 'veo-2.0-generate-001'}
+                                    {shotState.latencyMs
+                                      ? ` · ${(shotState.latencyMs / 1000).toFixed(1)}s`
+                                      : ''}
+                                    {shotState.attempts > 1 ? ` · ${shotState.attempts} attempts` : ''}
+                                  </div>
+                                )}
+                                {shotState.errorMessage && (
+                                  <div className="text-[11px] text-red-600 dark:text-red-400 leading-snug">
+                                    {shotState.errorMessage}
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     {/* Render Version History */}
@@ -3633,7 +4040,7 @@ export default function App() {
                           <div className="flex items-center gap-2 shrink-0">
                             <button
                               type="button"
-                              onClick={handleRenderVideo}
+                              onClick={() => handleRenderVideo({ retryFailedShotsOnly: false })}
                               disabled={isRenderingVideo}
                               className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap"
                             >
@@ -3984,10 +4391,10 @@ export default function App() {
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-slate-800">
                   <div>
                     <div className="text-xs text-slate-500 dark:text-slate-400 mb-1">
-                      Server-Side SDK Probe · @google/genai · Zero Client Key Exposure
+                      Server-Side NIM & SDK Probes · NVIDIA Nemotron & Google Media · Zero Client Key Exposure
                     </div>
                     <h1 className="font-display text-2xl font-bold text-slate-900 dark:text-slate-100">
-                      Gemini Model Availability & Milestone Status
+                      NVIDIA Nemotron & Media Model Availability
                     </h1>
                   </div>
                   <button

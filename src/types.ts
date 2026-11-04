@@ -107,17 +107,65 @@ export interface BackgroundMusicState {
   updatedAt: string;
 }
 
-export type RenderJobStatus = 'queued' | 'processing' | 'completed' | 'failed';
+export type RenderJobStatus =
+  | 'idle'
+  | 'queued'
+  | 'processing'
+  | 'generating'
+  | 'stitching'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
 
-export type RenderEnginePreference = 'ffmpeg_motion_compositor' | 'auto_omni_with_ffmpeg_fallback';
+export type AiVideoProviderId = 'google_veo' | 'gemini_omni';
 
-export type RenderEngineUsed = 'gemini_omni_video' | 'ffmpeg_motion_compositor';
+export type RenderEnginePreference =
+  | 'ai_video_google_veo'
+  | 'basic_slideshow_ffmpeg'
+  | 'ffmpeg_motion_compositor';
+
+export type RenderEngineUsed =
+  | 'google_veo_video'
+  | 'ffmpeg_motion_compositor';
+
+export type RenderFailureCategory =
+  | 'paid_tier_required'
+  | 'quota_exceeded'
+  | 'auth_or_missing_key'
+  | 'model_unavailable'
+  | 'invalid_video_output'
+  | 'transient_error'
+  | 'cancelled'
+  | 'validation_error';
+
+export type ShotRenderStatus = 'queued' | 'generating' | 'completed' | 'failed' | 'cancelled';
+
+export interface ShotRenderState {
+  shotNumber: number;
+  shotType: string;
+  durationSeconds: number;
+  status: ShotRenderStatus;
+  providerUsed?: AiVideoProviderId | 'ffmpeg_local';
+  engineUsed?: RenderEngineUsed;
+  modelUsed?: string;
+  remoteJobId?: string;
+  clipFileUrl?: string;
+  conformedFilePath?: string;
+  byteLength?: number;
+  attempts: number;
+  latencyMs?: number;
+  promptUsed?: string;
+  errorMessage?: string;
+  failureCategory?: RenderFailureCategory;
+  updatedAt: string;
+}
 
 export interface VideoRenderSettings {
   resolution: '1080x1920' | '720x1280';
   includeSubtitles: boolean;
   enginePreference: RenderEnginePreference;
   revisionNote?: string;
+  retryFailedShotsOnly?: boolean;
 }
 
 export interface VideoRenderJob {
@@ -128,9 +176,14 @@ export interface VideoRenderJob {
   progressPercent: number;
   stageMessage: string;
   requestedEngine: RenderEnginePreference;
+  providerUsed?: AiVideoProviderId | 'ffmpeg_local';
+  modelUsed?: string;
   engineUsed: RenderEngineUsed;
   engineLabel: string;
+  isAiVideoGenerated?: boolean;
   omniFallbackReason?: string;
+  failureCategory?: RenderFailureCategory;
+  shotResults?: ShotRenderState[];
   resolution: '1080x1920' | '720x1280';
   width: number;
   height: number;
@@ -149,6 +202,39 @@ export interface VideoRenderJob {
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
+  cancelledAt?: string;
+}
+
+export interface VideoProviderStatusInfo {
+  providerId: AiVideoProviderId;
+  providerName: string;
+  enginePreference: RenderEnginePreference;
+  defaultModelId: string;
+  supportedModels: string[];
+  envVarName: string;
+  configured: boolean;
+  modelAvailable: boolean;
+  disabledReason?: string;
+  timeoutMs?: number;
+  requiresPaidTierOrCredits: boolean;
+  supportedAspectRatios: string[];
+  supportedDurationsSeconds: number[];
+  docsUrl: string;
+  statusSummary: string;
+}
+
+export interface GeneratedVisualAsset {
+  id: string;
+  campaignId?: string;
+  assetType?: 'campaign_hero' | 'storyboard_frame' | 'video_thumbnail';
+  shotNumber?: number;
+  prompt: string;
+  promptUsed?: string;
+  modelUsed: string;
+  imageDataUrl: string;
+  mimeType?: string;
+  aspectRatio: '1:1' | '9:16' | '16:9';
+  createdAt: string;
 }
 
 export interface VideoApprovalState {
@@ -184,6 +270,7 @@ export interface Campaign {
   storyboard?: VideoConceptAndStoryboard;
   voiceover?: VoiceoverAudioAsset;
   backgroundMusic?: BackgroundMusicState;
+  visualAssets?: GeneratedVisualAsset[];
   activeRenderJob?: VideoRenderJob;
   latestCompletedRender?: VideoRenderJob;
   renderHistory?: VideoRenderJob[];

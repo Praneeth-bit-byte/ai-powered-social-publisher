@@ -10,7 +10,11 @@ import type {
 } from '../types.ts';
 import type { SampleProductPreset } from './sampleProducts.ts';
 import { VOICE_OPTIONS_META } from './milestone2Validators.ts';
-import { DEFAULT_RENDER_SETTINGS } from './milestone3Validators.ts';
+import {
+  DEFAULT_RENDER_SETTINGS,
+  normalizeLegacyCampaignVideoFields,
+  normalizeRenderEnginePreference,
+} from './milestone3Validators.ts';
 
 export interface StudioFormState {
   title: string;
@@ -435,7 +439,7 @@ export function createBlankStudioState(): StudioSessionState {
     voiceStylePrompt: '',
     voiceScriptDraft: '',
     musicPromptDraft: '',
-    renderSettings: { ...DEFAULT_RENDER_SETTINGS },
+    renderSettings: { ...DEFAULT_RENDER_SETTINGS, enginePreference: 'ai_video_google_veo' },
     rejectionReasonDraft: '',
     isAnalyzing: false,
     isSavingProfile: false,
@@ -507,7 +511,7 @@ export function applyUploadedImageToStudioState(
     ...blank,
     isAnalyzing: startAnalyzing,
     statusMessage: startAnalyzing
-      ? 'Analyzing uploaded product image with Gemini Vision to extract product details...'
+      ? 'Analyzing uploaded product image with NVIDIA Nemotron Vision to extract product details...'
       : null,
     form: {
       ...blank.form,
@@ -520,7 +524,8 @@ export function applyUploadedImageToStudioState(
 /**
  * Synchronizes studio state when an analyzed or saved Campaign is loaded.
  */
-export function applyCampaignToStudioState(campaign: Campaign): StudioSessionState {
+export function applyCampaignToStudioState(rawCampaign: Campaign): StudioSessionState {
+  const campaign = normalizeLegacyCampaignVideoFields(rawCampaign);
   const blank = createBlankStudioState();
   const normalizedCheck = validateAndNormalizeProductProfile(campaign.productProfile);
   const clonedProfile = normalizedCheck.valid && normalizedCheck.profile
@@ -604,14 +609,17 @@ export function applyCampaignToStudioState(campaign: Campaign): StudioSessionSta
         typeof latestRender?.includeSubtitles === 'boolean'
           ? latestRender.includeSubtitles
           : DEFAULT_RENDER_SETTINGS.includeSubtitles,
-      enginePreference:
-        latestRender?.requestedEngine || DEFAULT_RENDER_SETTINGS.enginePreference,
+      enginePreference: normalizeRenderEnginePreference(
+        latestRender?.requestedEngine ?? 'ai_video_google_veo'
+      ),
       revisionNote: '',
     },
     rejectionReasonDraft: campaign.approval?.rejectionReason || '',
     isRenderingVideo:
       campaign.activeRenderJob?.status === 'queued' ||
-      campaign.activeRenderJob?.status === 'processing',
+      campaign.activeRenderJob?.status === 'processing' ||
+      campaign.activeRenderJob?.status === 'generating' ||
+      campaign.activeRenderJob?.status === 'stitching',
   };
 }
 
@@ -778,3 +786,5 @@ export async function analyzeUploadedImageWithGemini(
     };
   }
 }
+
+export const analyzeUploadedProductImage = analyzeUploadedImageWithGemini;

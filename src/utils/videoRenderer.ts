@@ -5,18 +5,70 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { GoogleGenAI } from '@google/genai';
 import type {
+  AiVideoProviderId,
   Campaign,
   RenderEngineUsed,
+  RenderFailureCategory,
+  ShotRenderState,
   StoryboardShot,
+  VideoRenderJob,
   VideoRenderSettings,
 } from '../types.ts';
 import {
+  buildCommercialShotVideoPrompt,
+  classifyVideoGenerationError,
+  createInitialShotRenderStates,
+  getEngineDisplayMetadata,
+  isAiVideoEnginePreference,
   isSafeIdentifier,
+  updateShotRenderState,
   verifyAudioVideoDurationSync,
   verifyPlayableMp4Buffer,
 } from './milestone3Validators.ts';
+import {
+  DEFAULT_GOOGLE_VEO_MODEL_ID,
+  downloadAndVerifyVideoSource,
+  executeProviderShotGeneration,
+  resolveAiVideoProviderAdapter,
+  type AiVideoProviderAdapter,
+} from './videoProviders.ts';
 
 const execFileAsync = promisify(execFile);
+
+export const PRIMARY_AI_VIDEO_MODEL = DEFAULT_GOOGLE_VEO_MODEL_ID;
+
+export class VideoRenderError extends Error {
+  public readonly failureCategory: RenderFailureCategory;
+  public readonly shotResults: ShotRenderState[];
+  public readonly providerUsed?: AiVideoProviderId | 'ffmpeg_local';
+  public readonly modelUsed?: string;
+  public readonly engineUsed: RenderEngineUsed;
+  public readonly engineLabel: string;
+  public readonly isAiVideoGenerated: boolean;
+
+  constructor(
+    message: string,
+    options: {
+      failureCategory: RenderFailureCategory;
+      shotResults: ShotRenderState[];
+      providerUsed?: AiVideoProviderId | 'ffmpeg_local';
+      modelUsed?: string;
+      engineUsed: RenderEngineUsed;
+      engineLabel: string;
+      isAiVideoGenerated: boolean;
+    }
+  ) {
+    super(message);
+    this.name = 'VideoRenderError';
+    this.failureCategory = options.failureCategory;
+    this.shotResults = options.shotResults;
+    this.providerUsed = options.providerUsed;
+    this.modelUsed = options.modelUsed;
+    this.engineUsed = options.engineUsed;
+    this.engineLabel = options.engineLabel;
+    this.isAiVideoGenerated = options.isAiVideoGenerated;
+  }
+}
 
 const FONT_BOLD_CANDIDATES = [
   '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
@@ -196,8 +248,23 @@ export async function probeRenderedVideoFile(mp4FilePath: string): Promise<Probe
 }
 
 export interface RenderExecutionCallbacks {
-  onProgress?: (progressPercent: number, stageMessage: string) => void;
+  onProgress?: (
+    progressPercent: number,
+    stageMessage: string,
+    patch?: Partial<VideoRenderJob>
+  ) => void;
 }
+
+export type OmniShotVideoGeneratorFn = (params: {
+  shot: StoryboardShot;
+  shotIndex: number;
+  prompt: string;
+  mimeType: string;
+  base64Data: string;
+  duration: '5s' | '10s';
+  resolution: '720p' | '1080p';
+  signal?: AbortSignal;
+}) => Promise<{ videoBuffer: Buffer; modelUsed: string }>;
 
 export interface RenderPipelineResult {
   outputFilePath: string;
@@ -206,9 +273,13 @@ export interface RenderPipelineResult {
   width: number;
   height: number;
   durationSeconds: number;
+  providerUsed: AiVideoProviderId | 'ffmpeg_local';
+  modelUsed: string;
   engineUsed: RenderEngineUsed;
   engineLabel: string;
+  isAiVideoGenerated: boolean;
   omniFallbackReason?: string;
+  shotResults: ShotRenderState[];
   probedMetadata: ProbedMp4Metadata;
 }
 
@@ -238,7 +309,226 @@ function writeProductImageToTempFile(imageDataUrl: string, tempDir: string): {
 }
 
 /**
- * Renders a single storyboard shot using the FFmpeg 9:16 Motion-Compositor:
+ * Generates an animated 9:16 commercial video clip for a single storyboard shot using
+ * the `GoogleVeoVideoProviderAdapter` (`google_veo`), or an injected `omniShotGenerator`
+ * for deterministic unit testing.
+ * Never substitutes a static FFmpeg slideshow on failure.
+ */
+async function generateSingleShotWithProviderAdapter(params: {
+  adapter: AiVideoProviderAdapter;
+  shot: StoryboardShot;
+  shotIndex: number;
+  prompt: string;
+  mimeType: string;
+  base64Data: string;
+  width: number;
+  getGenAIClient?: (timeoutMs?: number) => GoogleGenAI;
+  omniShotGenerator?: OmniShotVideoGeneratorFn;
+  abortSignal?: AbortSignal;
+  onProgressUpdate?: (message: string, progressPercent?: number) => void;
+}): Promise<{
+  videoBuffer: Buffer;
+  providerId: AiVideoProviderId;
+  modelUsed: string;
+  remoteJobId?: string;
+  attempts: number;
+  latencyMs: number;
+}> {
+  const {
+    adapter,
+    shot,
+    shotIndex,
+    prompt,
+    mimeType,
+    base64Data,
+    width,
+    omniShotGenerator,
+    abortSignal,
+    onProgressUpdate,
+  } = params;
+
+  const durationParam: '5s' | '10s' = Number(shot.durationSeconds) > 5 ? '10s' : '5s';
+  const resolutionParam: '720p' | '1080p' = width >= 1080 ? '1080p' : '720p';
+  const startMs = Date.now();
+
+  if (abortSignal?.aborted) {
+    throw adapter.normalizeProviderError(
+      new Error('Video render job was cancelled by the user.'),
+      adapter.defaultModelId
+    );
+  }
+
+  if (omniShotGenerator) {
+    let attempts = 0;
+    const maxAttempts = 2;
+    let lastErr: unknown;
+    while (attempts < maxAttempts) {
+      attempts += 1;
+      if (abortSignal?.aborted) {
+        throw adapter.normalizeProviderError(
+          new Error('Video render job was cancelled by the user.'),
+          adapter.defaultModelId
+        );
+      }
+      try {
+        const result = await omniShotGenerator({
+          shot,
+          shotIndex,
+          prompt,
+          mimeType,
+          base64Data,
+          duration: durationParam,
+          resolution: resolutionParam,
+          signal: abortSignal,
+        });
+        const verifiedBuffer = await downloadAndVerifyVideoSource(
+          { kind: 'buffer', buffer: result.videoBuffer, mimeType: 'video/mp4' },
+          `${adapter.providerName} (${result.modelUsed})`
+        );
+        return {
+          videoBuffer: verifiedBuffer,
+          providerId: adapter.providerId,
+          modelUsed: result.modelUsed,
+          remoteJobId: `custom_${shot.shotNumber}_${attempts}`,
+          attempts,
+          latencyMs: Date.now() - startMs,
+        };
+      } catch (err) {
+        lastErr = err;
+        const normalized = adapter.normalizeProviderError(err, adapter.defaultModelId);
+        if (!normalized.retryable || attempts >= maxAttempts) {
+          throw normalized;
+        }
+      }
+    }
+    throw adapter.normalizeProviderError(lastErr, adapter.defaultModelId);
+  }
+
+  return executeProviderShotGeneration(adapter, {
+    shot,
+    shotIndex,
+    prompt,
+    mimeType,
+    base64Data,
+    aspectRatio: '9:16',
+    durationSeconds: Number(shot.durationSeconds) || 5,
+    resolution: resolutionParam,
+    signal: abortSignal,
+    onProgressUpdate,
+  });
+}
+
+/**
+ * Conforms a raw AI-generated MP4 shot clip to exact 9:16 dimensions (`width`x`height`),
+ * 24fps, H.264/yuv420p, and exact `durationSec`, optionally burning in the shot's lower-third
+ * voiceover caption and on-screen hook overlay while keeping the full-bleed animated AI video unobstructed.
+ */
+async function conformAiShotClipWithFfmpeg(params: {
+  rawAiVideoPath: string;
+  outputShotPath: string;
+  shot: StoryboardShot;
+  shotIndex: number;
+  campaign: Campaign;
+  settings: VideoRenderSettings;
+  tempDir: string;
+  width: number;
+  height: number;
+}): Promise<void> {
+  const {
+    rawAiVideoPath,
+    outputShotPath,
+    shot,
+    shotIndex,
+    campaign,
+    settings,
+    tempDir,
+    width,
+    height,
+  } = params;
+
+  const durationSec = Math.max(1, Math.min(15, Math.round(Number(shot.durationSeconds) || 3)));
+  const scaleFactor = width / 1080;
+
+  const fontBold = resolveExistingFont(FONT_BOLD_CANDIDATES);
+  const fontRegular = resolveExistingFont(FONT_REGULAR_CANDIDATES);
+  const fontBoldArg = fontBold ? `fontfile=${fontBold}:` : '';
+  const fontRegularArg = fontRegular ? `fontfile=${fontRegular}:` : '';
+
+  const filterChain: string[] = [
+    `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+    `crop=${width}:${height}`,
+    `fps=24`,
+  ];
+
+  const hookOverlayText = shot.onScreenTextOverlay?.trim() || '';
+  if (hookOverlayText) {
+    const hookTxtPath = path.join(tempDir, `ai_hook_${shotIndex}.txt`);
+    fs.writeFileSync(hookTxtPath, wrapTextForVerticalOverlay(hookOverlayText, 28, 2), 'utf-8');
+    filterChain.push(
+      `drawtext=${fontBoldArg}textfile=${hookTxtPath}:fontcolor=white:fontsize=${Math.round(
+        40 * scaleFactor
+      )}:line_spacing=${Math.round(
+        10 * scaleFactor
+      )}:box=1:boxcolor=0x090d16@0.72:boxborderw=${Math.round(
+        16 * scaleFactor
+      )}:x=(w-text_w)/2:y=${Math.round(1420 * scaleFactor)}`
+    );
+  }
+
+  const spokenText =
+    shot.spokenVoiceoverSegment?.trim() ||
+    campaign.storyboard?.fullVoiceoverScript?.trim() ||
+    '';
+  if (settings.includeSubtitles && spokenText) {
+    const subTxtPath = path.join(tempDir, `ai_sub_${shotIndex}.txt`);
+    fs.writeFileSync(subTxtPath, wrapTextForVerticalOverlay(spokenText, 36, 3), 'utf-8');
+    filterChain.push(
+      `drawtext=${fontRegularArg}textfile=${subTxtPath}:fontcolor=0xf8fafc:fontsize=${Math.round(
+        30 * scaleFactor
+      )}:line_spacing=${Math.round(
+        8 * scaleFactor
+      )}:box=1:boxcolor=0x0f172a@0.82:boxborderw=${Math.round(
+        14 * scaleFactor
+      )}:x=(w-text_w)/2:y=${Math.round(1560 * scaleFactor)}`
+    );
+  }
+
+  filterChain.push('format=yuv420p');
+
+  // Use stream_loop -1 on input so if a 5s AI clip is conformed to e.g. 6s it seamlessly covers the duration
+  await execFileAsync(
+    'ffmpeg',
+    [
+      '-y',
+      '-stream_loop',
+      '-1',
+      '-i',
+      rawAiVideoPath,
+      '-vf',
+      filterChain.join(','),
+      '-t',
+      String(durationSec),
+      '-r',
+      '24',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-crf',
+      '20',
+      '-pix_fmt',
+      'yuv420p',
+      '-an',
+      '-movflags',
+      '+faststart',
+      outputShotPath,
+    ],
+    { timeout: 45000 }
+  );
+}
+
+/**
+ * Renders a single storyboard shot using the FFmpeg 9:16 Motion-Compositor (Basic Motion/Slideshow Mode):
  * - Preserves true product geometry and colors (never stretches the product photo)
  * - Applies shot-specific camera pan/zoom framing grounded in `shot.cameraMovement`
  * - Overlays top brand/offer safe-zone bar, shot badge, on-screen text hook, and optional subtitles
@@ -356,13 +646,10 @@ async function renderSingleShotWithFfmpeg(params: {
   let overlayYExpr = `${Math.round(350 * scaleFactor)}`;
 
   if (camLower.includes('pan') || camLower.includes('track') || shotIndex % 3 === 1) {
-    // Smooth horizontal pan across shot duration
     overlayXExpr = `(W-w)/2-${driftPx}+2*${driftPx}*(t/${durationSec})`;
   } else if (camLower.includes('tilt') || camLower.includes('rise') || shotIndex % 3 === 2) {
-    // Smooth vertical pedestal rise
     overlayYExpr = `${Math.round(368 * scaleFactor)}-${Math.round(36 * scaleFactor)}*(t/${durationSec})`;
   } else {
-    // Gentle diagonal studio push drift
     overlayXExpr = `(W-w)/2-${Math.round(14 * scaleFactor)}+${Math.round(28 * scaleFactor)}*(t/${durationSec})`;
     overlayYExpr = `${Math.round(360 * scaleFactor)}-${Math.round(22 * scaleFactor)}*(t/${durationSec})`;
   }
@@ -387,10 +674,8 @@ async function renderSingleShotWithFfmpeg(params: {
 
   const filterSteps: string[] = [
     `[0:v][1:v]overlay=x='${overlayXExpr}':y='${overlayYExpr}':shortest=1`,
-    // Top safe-zone dark studio header scrim
     `drawbox=x=0:y=0:w=${width}:h=${topBarH}:color=0x090d16@0.92:t=fill`,
     `drawbox=x=0:y=${topBarH}:w=${width}:h=${accentBarH}:color=${accentHex}@0.95:t=fill`,
-    // Bottom safe-zone caption & CTA studio scrim
     `drawbox=x=0:y=${bottomBarY}:w=${width}:h=${bottomBarH}:color=0x090d16@0.92:t=fill`,
     `drawbox=x=0:y=${bottomBarY}:w=${width}:h=${accentBarH}:color=${accentHex}@0.95:t=fill`,
   ];
@@ -399,28 +684,24 @@ async function renderSingleShotWithFfmpeg(params: {
   const fontRegularArg = fontRegular ? `fontfile=${fontRegular}:` : '';
   const fontMonoArg = fontMono ? `fontfile=${fontMono}:` : '';
 
-  // 1. Brand & Product Header
   filterSteps.push(
     `drawtext=${fontBoldArg}textfile=${headerTxtPath}:fontcolor=white:fontsize=${Math.round(
       32 * scaleFactor
     )}:x=(w-text_w)/2:y=${Math.round(68 * scaleFactor)}`
   );
 
-  // 2. Shot number, timecode & shotType badge
   filterSteps.push(
     `drawtext=${fontMonoArg}textfile=${shotMetaTxtPath}:fontcolor=0xfb923c:fontsize=${Math.round(
       24 * scaleFactor
     )}:x=(w-text_w)/2:y=${Math.round(132 * scaleFactor)}`
   );
 
-  // 3. Camera direction micro-label
   filterSteps.push(
     `drawtext=${fontRegularArg}textfile=${cameraTxtPath}:fontcolor=0x94a3b8:fontsize=${Math.round(
       20 * scaleFactor
     )}:x=(w-text_w)/2:y=${Math.round(176 * scaleFactor)}`
   );
 
-  // 4. On-screen text overlay headline (lower-third hook)
   filterSteps.push(
     `drawtext=${fontBoldArg}textfile=${hookTxtPath}:fontcolor=white:fontsize=${Math.round(
       46 * scaleFactor
@@ -429,7 +710,6 @@ async function renderSingleShotWithFfmpeg(params: {
     )}`
   );
 
-  // 5. Optional burned-in voiceover subtitle/caption overlay
   if (settings.includeSubtitles && spokenText) {
     filterSteps.push(
       `drawtext=${fontRegularArg}textfile=${subtitleTxtPath}:fontcolor=0xe2e8f0:fontsize=${Math.round(
@@ -440,7 +720,6 @@ async function renderSingleShotWithFfmpeg(params: {
     );
   }
 
-  // Smooth fade-in on shot start
   filterSteps.push(`fade=t=in:st=0:d=0.22,format=yuv420p[vout]`);
 
   const shotOutputPath = path.join(tempDir, `shot_${shotIndex}.mp4`);
@@ -488,14 +767,13 @@ async function renderSingleShotWithFfmpeg(params: {
 
 /**
  * Executes the complete 9:16 vertical MP4 video rendering pipeline for a campaign:
- * 1. Validates inputs and creates an isolated temporary workspace.
- * 2. Optionally probes `gemini-omni-1.1-flash` if requested; falls back cleanly to the
- *    FFmpeg 9:16 Motion-Compositor when paid video generation is unavailable.
- * 3. Renders each storyboard shot respecting shot durations, timecodes, product accuracy,
- *    and subtitle settings.
- * 4. Concatenates shots and mixes the campaign's generated voiceover WAV + optional music track.
- * 5. Verifies the final MP4 with both atom inspection (`ftyp`/`moov`/`mdat`) and `ffprobe`
- *    duration/resolution checks.
+ * - In `ai_video_omni` mode: Generates a genuine animated 9:16 video clip per storyboard shot
+ *   using `gemini-omni-1.1-flash` (`ai.interactions.create`), validates each clip, conforms it to
+ *   exact shot timing, and NEVER silently substitutes the static FFmpeg slideshow on failure.
+ * - In `basic_slideshow_ffmpeg` / `ffmpeg_motion_compositor` mode: Renders the local FFmpeg
+ *   static product card slideshow explicitly labeled as non-AI video.
+ * - Supports per-shot progress tracking, `retryFailedShotsOnly` (reusing already-completed shots),
+ *   and `abortSignal` cancellation.
  */
 export async function renderCampaignVerticalVideo(params: {
   campaign: Campaign;
@@ -504,9 +782,25 @@ export async function renderCampaignVerticalVideo(params: {
   videosDir: string;
   audioDir: string;
   getGenAIClient?: (timeoutMs?: number) => GoogleGenAI;
+  videoProviderAdapter?: AiVideoProviderAdapter;
+  omniShotGenerator?: OmniShotVideoGeneratorFn;
+  previousShotResults?: ShotRenderState[];
+  abortSignal?: AbortSignal;
   callbacks?: RenderExecutionCallbacks;
 }): Promise<RenderPipelineResult> {
-  const { campaign, settings, jobId, videosDir, audioDir, getGenAIClient, callbacks } = params;
+  const {
+    campaign,
+    settings,
+    jobId,
+    videosDir,
+    audioDir,
+    getGenAIClient,
+    videoProviderAdapter,
+    omniShotGenerator,
+    previousShotResults,
+    abortSignal,
+    callbacks,
+  } = params;
 
   if (!isSafeIdentifier(campaign.id) || !isSafeIdentifier(jobId)) {
     throw new Error('Unsafe campaign or render job identifier.');
@@ -534,6 +828,7 @@ export async function renderCampaignVerticalVideo(params: {
     fs.mkdirSync(videosDir, { recursive: true });
   }
 
+  const resolvedVideosDir = path.resolve(videosDir);
   const [width, height] = settings.resolution === '720x1280' ? [720, 1280] : [1080, 1920];
   const shots = campaign.storyboard.shots;
   const totalTargetDuration = Math.max(
@@ -541,104 +836,302 @@ export async function renderCampaignVerticalVideo(params: {
     shots.reduce((sum, s) => sum + Math.max(1, Math.min(15, Math.round(Number(s.durationSeconds) || 3))), 0)
   );
 
+  const isStrictAiMode = isAiVideoEnginePreference(settings.enginePreference);
+  const activeAdapter: AiVideoProviderAdapter | null = isStrictAiMode
+    ? videoProviderAdapter || resolveAiVideoProviderAdapter(settings.enginePreference)
+    : null;
+
+  const engineMeta = getEngineDisplayMetadata(settings.enginePreference);
+  let providerUsed: AiVideoProviderId | 'ffmpeg_local' = activeAdapter
+    ? activeAdapter.providerId
+    : engineMeta.providerUsed;
+  let modelUsed = activeAdapter ? activeAdapter.defaultModelId : engineMeta.modelUsed;
+  let engineUsed: RenderEngineUsed = activeAdapter
+    ? activeAdapter.engineUsed
+    : engineMeta.engineUsed;
+  let engineLabel = activeAdapter
+    ? `${activeAdapter.providerName} · ${activeAdapter.defaultModelId}`
+    : engineMeta.engineLabel;
+  let isAiVideoGenerated = engineMeta.isAiVideoGenerated;
+  let omniFallbackReason: string | undefined;
+
+  let shotResults: ShotRenderState[] = createInitialShotRenderStates(
+    campaign,
+    previousShotResults || campaign.activeRenderJob?.shotResults || campaign.renderHistory?.[0]?.shotResults,
+    Boolean(settings.retryFailedShotsOnly)
+  );
+
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `adstudio_render_${jobId}_`));
 
+  const checkAbort = () => {
+    if (abortSignal?.aborted) {
+      shotResults = shotResults.map((s) =>
+        s.status === 'generating' || s.status === 'queued'
+          ? { ...s, status: 'cancelled', updatedAt: new Date().toISOString() }
+          : s
+      );
+      throw new VideoRenderError('Video render job was cancelled by the user.', {
+        failureCategory: 'cancelled',
+        shotResults,
+        providerUsed,
+        modelUsed,
+        engineUsed,
+        engineLabel,
+        isAiVideoGenerated,
+      });
+    }
+  };
+
   try {
-    callbacks?.onProgress?.(12, 'Decoding product image and preparing 9:16 vertical studio canvas...');
+    checkAbort();
+    callbacks?.onProgress?.(
+      10,
+      isStrictAiMode && activeAdapter
+        ? `Decoding product reference image and preparing per-shot 9:16 prompts for ${activeAdapter.providerName}...`
+        : 'Decoding product image and preparing 9:16 vertical studio canvas...',
+      {
+        status: 'generating',
+        shotResults,
+        providerUsed,
+        modelUsed,
+        engineUsed,
+        engineLabel,
+        isAiVideoGenerated,
+      }
+    );
+
     const { filePath: productImagePath, mimeType, base64Data } = writeProductImageToTempFile(
       campaign.imageDataUrl,
       tempDir
     );
 
-    let engineUsed: RenderEngineUsed = 'ffmpeg_motion_compositor';
-    let engineLabel = 'FFmpeg 9:16 Motion-Compositor (Fallback — Not AI Video)';
-    let omniFallbackReason: string | undefined;
-    let omniBaseVideoPath: string | null = null;
+    const shotFilePaths: string[] = [];
 
-    // Optional attempt with Gemini Omni 1.1 Flash (`gemini-omni-1.1-flash`) via Interactions API
-    if (settings.enginePreference === 'auto_omni_with_ffmpeg_fallback' && getGenAIClient) {
-      callbacks?.onProgress?.(
-        20,
-        'Probing gemini-omni-1.1-flash (Interactions API) for 9:16 image-to-video generation...'
-      );
-      try {
-        const ai = getGenAIClient(45000);
-        const masterPrompt = `${campaign.storyboard.masterCinematicPrompt9x16}. Preserve exact product appearance, colors, and labels.`;
-        const interaction = await ai.interactions.create({
-          model: 'gemini-omni-1.1-flash',
-          input: [
-            {
-              type: 'image',
-              mime_type: mimeType,
-              data: base64Data,
-            },
-            {
-              type: 'text',
-              text: masterPrompt,
-            },
-          ],
-          background: false,
-          store: false,
-          stream: false,
-          response_format: {
-            type: 'video',
-            aspect_ratio: '9:16',
-            duration: '5s',
-            resolution: settings.resolution === '1080x1920' ? '1080p' : '720p',
-          },
+    if (isStrictAiMode && activeAdapter) {
+      // STRICT PER-SHOT AI VIDEO GENERATION MODE (Never silently falls back to static FFmpeg slideshow)
+      for (let i = 0; i < shots.length; i++) {
+        checkAbort();
+        const shot = shots[i];
+        const existingShotState = shotResults.find((s) => s.shotNumber === shot.shotNumber);
+        const persistedShotFilename = `render_${campaign.id}_shot_${shot.shotNumber}.mp4`;
+        const persistedShotPath = path.resolve(resolvedVideosDir, persistedShotFilename);
+
+        // Reuse already-completed shot if retryFailedShotsOnly is enabled and the MP4 clip exists and is valid
+        if (
+          settings.retryFailedShotsOnly &&
+          existingShotState?.status === 'completed' &&
+          fs.existsSync(persistedShotPath)
+        ) {
+          const checkBuf = fs.readFileSync(persistedShotPath);
+          if (verifyPlayableMp4Buffer(checkBuf).valid) {
+            shotFilePaths.push(persistedShotPath);
+            const pct = 15 + Math.round(((i + 1) / shots.length) * 60);
+            callbacks?.onProgress?.(
+              pct,
+              `Reused verified AI video clip for Shot 0${shot.shotNumber}/${shots.length} (${shot.shotType})...`,
+              { status: 'generating', shotResults }
+            );
+            continue;
+          }
+        }
+
+        const shotPrompt = buildCommercialShotVideoPrompt(campaign, shot);
+        shotResults = updateShotRenderState(shotResults, shot.shotNumber, {
+          status: 'generating',
+          providerUsed: activeAdapter.providerId,
+          engineUsed: activeAdapter.engineUsed,
+          modelUsed: activeAdapter.defaultModelId,
+          promptUsed: shotPrompt,
+          errorMessage: undefined,
+          failureCategory: undefined,
         });
 
-        const videoPart = (interaction as unknown as { output_video?: { data?: string } }).output_video;
-        if (videoPart?.data) {
-          const rawOmniBuf = Buffer.from(videoPart.data, 'base64');
-          if (rawOmniBuf.byteLength > 1024) {
-            omniBaseVideoPath = path.join(tempDir, 'omni_raw.mp4');
-            fs.writeFileSync(omniBaseVideoPath, rawOmniBuf);
-            engineUsed = 'gemini_omni_video';
-            engineLabel = 'Gemini Omni 1.1 Flash (9:16 AI Video) + FFmpeg Audio/Caption Mastering';
-          } else {
-            throw new Error('gemini-omni-1.1-flash returned an empty video payload.');
+        const startPct = 15 + Math.round((i / shots.length) * 60);
+        callbacks?.onProgress?.(
+          startPct,
+          `Generating AI video for Shot 0${shot.shotNumber}/${shots.length} (${shot.shotType}) via ${activeAdapter.providerName} (${activeAdapter.defaultModelId})...`,
+          { status: 'generating', shotResults }
+        );
+
+        try {
+          const genResult = await generateSingleShotWithProviderAdapter({
+            adapter: activeAdapter,
+            shot,
+            shotIndex: i,
+            prompt: shotPrompt,
+            mimeType,
+            base64Data,
+            width,
+            getGenAIClient,
+            omniShotGenerator,
+            abortSignal,
+            onProgressUpdate: (msg) => {
+              callbacks?.onProgress?.(startPct, msg, {
+                status: 'generating',
+                shotResults,
+              });
+            },
+          });
+
+          modelUsed = genResult.modelUsed;
+          providerUsed = genResult.providerId;
+          engineLabel = `${activeAdapter.providerName} · ${genResult.modelUsed}`;
+
+          const rawAiShotPath = path.join(tempDir, `raw_ai_shot_${shot.shotNumber}.mp4`);
+          fs.writeFileSync(rawAiShotPath, genResult.videoBuffer);
+
+          // Probe raw clip to verify it has a genuine video stream with non-zero dimensions and duration
+          const rawProbe = await probeRenderedVideoFile(rawAiShotPath);
+          if (
+            !rawProbe.videoCodec ||
+            rawProbe.width <= 0 ||
+            rawProbe.height <= 0 ||
+            rawProbe.videoDurationSeconds <= 0
+          ) {
+            throw new Error(
+              `Invalid video output from ${activeAdapter.providerName}: raw clip has no playable video stream (codec=${rawProbe.videoCodec}, ${rawProbe.width}x${rawProbe.height}, duration=${rawProbe.videoDurationSeconds}s).`
+            );
           }
-        } else {
-          throw new Error('gemini-omni-1.1-flash response did not contain output_video data.');
+
+          await conformAiShotClipWithFfmpeg({
+            rawAiVideoPath: rawAiShotPath,
+            outputShotPath: persistedShotPath,
+            shot,
+            shotIndex: i,
+            campaign,
+            settings,
+            tempDir,
+            width,
+            height,
+          });
+
+          const conformedBuf = fs.readFileSync(persistedShotPath);
+          const conformedCheck = verifyPlayableMp4Buffer(conformedBuf);
+          if (!conformedCheck.valid) {
+            throw new Error(
+              `Invalid video output: conformed AI clip for Shot ${shot.shotNumber} failed MP4 check: ${conformedCheck.error}`
+            );
+          }
+
+          shotFilePaths.push(persistedShotPath);
+          shotResults = updateShotRenderState(shotResults, shot.shotNumber, {
+            status: 'completed',
+            providerUsed: genResult.providerId,
+            engineUsed: activeAdapter.engineUsed,
+            modelUsed: genResult.modelUsed,
+            remoteJobId: genResult.remoteJobId,
+            clipFileUrl: `/api/video/${persistedShotFilename}`,
+            conformedFilePath: persistedShotPath,
+            byteLength: conformedBuf.byteLength,
+            attempts: (existingShotState?.attempts || 0) + genResult.attempts,
+            latencyMs: genResult.latencyMs,
+            promptUsed: shotPrompt,
+            errorMessage: undefined,
+            failureCategory: undefined,
+          });
+
+          const donePct = 15 + Math.round(((i + 1) / shots.length) * 60);
+          callbacks?.onProgress?.(
+            donePct,
+            `Completed AI video clip for Shot 0${shot.shotNumber}/${shots.length} (${shot.shotType}) via ${genResult.modelUsed}.`,
+            { status: 'generating', shotResults }
+          );
+        } catch (shotErr: unknown) {
+          const classified = classifyVideoGenerationError(
+            shotErr,
+            `${activeAdapter.providerName} (${activeAdapter.defaultModelId})`
+          );
+          shotResults = updateShotRenderState(shotResults, shot.shotNumber, {
+            status: classified.category === 'cancelled' ? 'cancelled' : 'failed',
+            providerUsed: activeAdapter.providerId,
+            engineUsed: activeAdapter.engineUsed,
+            modelUsed: activeAdapter.defaultModelId,
+            attempts: (existingShotState?.attempts || 0) + 1,
+            promptUsed: shotPrompt,
+            errorMessage: classified.userMessage,
+            failureCategory: classified.category,
+          });
+
+          if (classified.category === 'cancelled') {
+            shotResults = shotResults.map((s) =>
+              s.status === 'queued' ? { ...s, status: 'cancelled' } : s
+            );
+          }
+
+          throw new VideoRenderError(
+            `Shot 0${shot.shotNumber} (${shot.shotType}) AI video generation failed: ${classified.userMessage}`,
+            {
+              failureCategory: classified.category,
+              shotResults,
+              providerUsed: activeAdapter.providerId,
+              modelUsed: activeAdapter.defaultModelId,
+              engineUsed: activeAdapter.engineUsed,
+              engineLabel: `${activeAdapter.providerName} · ${activeAdapter.defaultModelId}`,
+              isAiVideoGenerated: false,
+            }
+          );
         }
-      } catch (omniErr: unknown) {
-        const rawReason = omniErr instanceof Error ? omniErr.message : String(omniErr);
-        omniFallbackReason = `gemini-omni-1.1-flash unavailable on current API key tier (${rawReason.slice(
-          0,
-          140
-        )}). Rendered using FFmpeg 9:16 Motion-Compositor fallback.`;
-        engineUsed = 'ffmpeg_motion_compositor';
-        engineLabel = 'FFmpeg 9:16 Motion-Compositor (Fallback — Not AI Video)';
+      }
+    } else {
+      // BASIC MOTION / SLIDESHOW RENDER MODE (FFmpeg Static Product Card Compositor)
+      for (let i = 0; i < shots.length; i++) {
+        checkAbort();
+        const shot = shots[i];
+        const shotStartMs = Date.now();
+        shotResults = updateShotRenderState(shotResults, shot.shotNumber, {
+          status: 'generating',
+          providerUsed: 'ffmpeg_local',
+          engineUsed: 'ffmpeg_motion_compositor',
+          modelUsed: 'ffmpeg_motion_compositor',
+        });
+
+        const pct = 20 + Math.round(((i + 1) / shots.length) * 50);
+        callbacks?.onProgress?.(
+          pct,
+          `Compositing Basic Motion Card for Shot 0${shot.shotNumber}/${shots.length} (${shot.timecodeRange} · ${shot.shotType}) at ${width}×${height}...`,
+          { status: 'generating', shotResults }
+        );
+
+        const shotPath = await renderSingleShotWithFfmpeg({
+          shot,
+          shotIndex: i,
+          totalShots: shots.length,
+          campaign,
+          settings,
+          productImagePath,
+          tempDir,
+          width,
+          height,
+        });
+
+        const persistedShotFilename = `render_${campaign.id}_shot_${shot.shotNumber}.mp4`;
+        const persistedShotPath = path.resolve(resolvedVideosDir, persistedShotFilename);
+        fs.copyFileSync(shotPath, persistedShotPath);
+        const shotBuf = fs.readFileSync(persistedShotPath);
+
+        shotFilePaths.push(persistedShotPath);
+        shotResults = updateShotRenderState(shotResults, shot.shotNumber, {
+          status: 'completed',
+          providerUsed: 'ffmpeg_local',
+          engineUsed: 'ffmpeg_motion_compositor',
+          modelUsed: 'ffmpeg_motion_compositor',
+          clipFileUrl: `/api/video/${persistedShotFilename}`,
+          conformedFilePath: persistedShotPath,
+          byteLength: shotBuf.byteLength,
+          attempts: 1,
+          latencyMs: Date.now() - shotStartMs,
+        });
       }
     }
 
-    // Render each shot segment sequentially with progress reporting
-    const shotFilePaths: string[] = [];
-    for (let i = 0; i < shots.length; i++) {
-      const shot = shots[i];
-      const pct = 25 + Math.round(((i + 1) / shots.length) * 45);
-      callbacks?.onProgress?.(
-        pct,
-        `Rendering Shot 0${shot.shotNumber}/${shots.length} (${shot.timecodeRange} · ${shot.shotType}) at ${width}×${height}...`
-      );
-
-      const shotPath = await renderSingleShotWithFfmpeg({
-        shot,
-        shotIndex: i,
-        totalShots: shots.length,
-        campaign,
-        settings,
-        productImagePath,
-        tempDir,
-        width,
-        height,
-      });
-      shotFilePaths.push(shotPath);
-    }
+    checkAbort();
 
     // Concatenate all rendered shot MP4s into a continuous 9:16 video stream
-    callbacks?.onProgress?.(75, 'Concatenating 9:16 storyboard shots and synchronizing timecodes...');
+    callbacks?.onProgress?.(
+      78,
+      'Stitching 9:16 storyboard shot clips and synchronizing timecodes...',
+      { status: 'stitching', shotResults }
+    );
     const concatListPath = path.join(tempDir, 'concat_shots.txt');
     const concatLines = shotFilePaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n');
     fs.writeFileSync(concatListPath, concatLines, 'utf-8');
@@ -661,23 +1154,24 @@ export async function renderCampaignVerticalVideo(params: {
       { timeout: 30000 }
     );
 
+    checkAbort();
+
     // Master final MP4 by mixing voiceover WAV + optional background music track
     callbacks?.onProgress?.(
       88,
       musicPath
         ? 'Mixing 24kHz voiceover WAV with ducked background music and encoding H.264/AAC MP4...'
-        : 'Mastering 24kHz voiceover WAV audio track and encoding H.264/AAC 9:16 MP4...'
+        : 'Mastering 24kHz voiceover WAV audio track and encoding H.264/AAC 9:16 MP4...',
+      { status: 'stitching', shotResults }
     );
 
     const outputFilename = `render_${campaign.id}_${jobId}.mp4`;
-    const resolvedVideosDir = path.resolve(videosDir);
     const outputFilePath = path.resolve(resolvedVideosDir, outputFilename);
     if (!outputFilePath.startsWith(resolvedVideosDir + path.sep)) {
       throw new Error('Invalid output video file path.');
     }
 
     if (musicPath) {
-      // Mix voiceover (100% volume, padded to totalTargetDuration) + music (looped/ducked at 18% volume)
       await execFileAsync(
         'ffmpeg',
         [
@@ -715,7 +1209,6 @@ export async function renderCampaignVerticalVideo(params: {
         { timeout: 45000 }
       );
     } else {
-      // Voiceover-Only mode: pad or trim voiceover stream to exact totalTargetDuration so A/V durations match
       await execFileAsync(
         'ffmpeg',
         [
@@ -750,7 +1243,11 @@ export async function renderCampaignVerticalVideo(params: {
       );
     }
 
-    callbacks?.onProgress?.(96, 'Verifying playable MP4 container atoms and audio/video synchronization...');
+    callbacks?.onProgress?.(
+      96,
+      'Verifying playable MP4 container atoms and audio/video synchronization...',
+      { status: 'stitching', shotResults }
+    );
 
     const mp4Buffer = fs.readFileSync(outputFilePath);
     const atomCheck = verifyPlayableMp4Buffer(mp4Buffer);
@@ -776,7 +1273,13 @@ export async function renderCampaignVerticalVideo(params: {
       throw new Error(syncCheck.error || 'Audio/video duration synchronization check failed.');
     }
 
-    callbacks?.onProgress?.(100, '9:16 vertical MP4 render completed and verified.');
+    callbacks?.onProgress?.(
+      100,
+      isAiVideoGenerated
+        ? 'Per-shot 9:16 AI video generation and audio mastering completed and verified.'
+        : 'Basic Motion/Slideshow 9:16 MP4 render completed and verified.',
+      { status: 'completed', shotResults }
+    );
 
     return {
       outputFilePath,
@@ -785,9 +1288,13 @@ export async function renderCampaignVerticalVideo(params: {
       width: probedMetadata.width,
       height: probedMetadata.height,
       durationSeconds: Math.round(probedMetadata.videoDurationSeconds * 10) / 10,
+      providerUsed,
+      modelUsed,
       engineUsed,
       engineLabel,
+      isAiVideoGenerated,
       omniFallbackReason,
+      shotResults,
       probedMetadata,
     };
   } finally {
@@ -798,3 +1305,4 @@ export async function renderCampaignVerticalVideo(params: {
     }
   }
 }
+

@@ -10,7 +10,7 @@ import type {
 export const DEFAULT_RENDER_SETTINGS: VideoRenderSettings = {
   resolution: '1080x1920',
   includeSubtitles: true,
-  enginePreference: 'ffmpeg_motion_compositor',
+  enginePreference: 'ai_video_google_veo',
   revisionNote: '',
 };
 
@@ -184,6 +184,119 @@ export function checkCampaignRenderReadiness(campaign: Campaign | null | undefin
 }
 
 /**
+ * Normalizes any incoming or persisted legacy RenderEnginePreference value so saved campaigns
+ * created with older providers remain 100% compatible with the Google-first architecture.
+ */
+export function normalizeRenderEnginePreference(rawPref: unknown): RenderEnginePreference {
+  if (rawPref === 'basic_slideshow_ffmpeg') {
+    return 'basic_slideshow_ffmpeg';
+  }
+  if (rawPref === 'ffmpeg_motion_compositor') {
+    return 'ffmpeg_motion_compositor';
+  }
+  if (
+    rawPref === 'ai_video_google_veo' ||
+    rawPref === 'ai_video_cosmos_nano' ||
+    rawPref === 'ai_video_auto' ||
+    rawPref === 'ai_video_omni' ||
+    rawPref === 'ai_video_veo' ||
+    rawPref === 'ai_video_runway' ||
+    rawPref === 'ai_video_luma' ||
+    rawPref === 'auto_omni_with_ffmpeg_fallback'
+  ) {
+    return 'ai_video_google_veo';
+  }
+  return 'ffmpeg_motion_compositor';
+}
+
+/**
+ * Normalizes a persisted VideoRenderJob from disk so legacy provider/engine fields
+ * map cleanly to current types without mutating historical fingerprints or approval state.
+ */
+export function normalizePersistedRenderJob(job: VideoRenderJob): VideoRenderJob {
+  const requestedEngine = normalizeRenderEnginePreference(job.requestedEngine);
+  const isFfmpeg =
+    job.engineUsed === 'ffmpeg_motion_compositor' || job.providerUsed === 'ffmpeg_local';
+  const engineUsed: RenderEngineUsed = isFfmpeg
+    ? 'ffmpeg_motion_compositor'
+    : 'google_veo_video';
+  const providerUsed: import('../types.ts').AiVideoProviderId | 'ffmpeg_local' = isFfmpeg
+    ? 'ffmpeg_local'
+    : 'google_veo';
+
+  const normalizedShots = Array.isArray(job.shotResults)
+    ? job.shotResults.map((s) => ({
+        ...s,
+        providerUsed:
+          s.providerUsed === 'ffmpeg_local' ? ('ffmpeg_local' as const) : ('google_veo' as const),
+        engineUsed:
+          s.engineUsed === 'ffmpeg_motion_compositor'
+            ? ('ffmpeg_motion_compositor' as const)
+            : ('google_veo_video' as const),
+      }))
+    : job.shotResults;
+
+  return {
+    ...job,
+    requestedEngine,
+    providerUsed,
+    engineUsed,
+    shotResults: normalizedShots,
+  };
+}
+
+/**
+ * Preserves existing campaign compatibility when loading saved campaigns from disk.
+ */
+export function normalizeLegacyCampaignVideoFields(campaign: Campaign): Campaign {
+  return {
+    ...campaign,
+    activeRenderJob: campaign.activeRenderJob
+      ? normalizePersistedRenderJob(campaign.activeRenderJob)
+      : undefined,
+    latestCompletedRender: campaign.latestCompletedRender
+      ? normalizePersistedRenderJob(campaign.latestCompletedRender)
+      : undefined,
+    renderHistory: Array.isArray(campaign.renderHistory)
+      ? campaign.renderHistory.map(normalizePersistedRenderJob)
+      : undefined,
+  };
+}
+
+/**
+ * Returns true when the selected engine preference requests genuine per-shot AI video generation
+ * via the Google Veo 2.0 provider rather than the local FFmpeg static card slideshow.
+ */
+export function isAiVideoEnginePreference(pref?: unknown): boolean {
+  return normalizeRenderEnginePreference(pref) === 'ai_video_google_veo' && pref !== undefined;
+}
+
+export function getEngineDisplayMetadata(pref: RenderEnginePreference | string): {
+  providerUsed: import('../types.ts').AiVideoProviderId | 'ffmpeg_local';
+  modelUsed: string;
+  engineUsed: RenderEngineUsed;
+  engineLabel: string;
+  isAiVideoGenerated: boolean;
+} {
+  if (isAiVideoEnginePreference(pref)) {
+    return {
+      providerUsed: 'google_veo',
+      modelUsed: 'veo-2.0-generate-001',
+      engineUsed: 'google_veo_video',
+      engineLabel: 'Google Veo 2.0 (veo-2.0-generate-001 · 9:16 AI Video)',
+      isAiVideoGenerated: true,
+    };
+  }
+  return {
+    providerUsed: 'ffmpeg_local',
+    modelUsed: 'ffmpeg_motion_compositor',
+    engineUsed: 'ffmpeg_motion_compositor',
+    engineLabel: 'Basic Motion/Slideshow Render (FFmpeg 9:16 Motion-Compositor — Not AI Video)',
+    isAiVideoGenerated: false,
+  };
+}
+
+/**
  * Prevents duplicate concurrent render submissions for the same campaign.
  */
 export function canStartNewRenderJob(campaign: Campaign): {
@@ -191,10 +304,16 @@ export function canStartNewRenderJob(campaign: Campaign): {
   error?: string;
 } {
   const active = campaign.activeRenderJob;
-  if (active && (active.status === 'queued' || active.status === 'processing')) {
+  if (
+    active &&
+    (active.status === 'queued' ||
+      active.status === 'processing' ||
+      active.status === 'generating' ||
+      active.status === 'stitching')
+  ) {
     return {
       allowed: false,
-      error: `A video render job (${active.id}, v${active.versionNumber}) is already ${active.status} (${active.progressPercent}%). Please wait for it to finish before starting another render.`,
+      error: `A video render job (${active.id}, v${active.versionNumber}) is already ${active.status} (${active.progressPercent}%). Please wait for it to finish or cancel it before starting another render.`,
     };
   }
   return { allowed: true };
@@ -252,13 +371,12 @@ export function validateRenderRequest(
   const includeSubtitles =
     typeof raw.includeSubtitles === 'boolean' ? raw.includeSubtitles : true;
 
-  const enginePreference: RenderEnginePreference =
-    raw.enginePreference === 'auto_omni_with_ffmpeg_fallback'
-      ? 'auto_omni_with_ffmpeg_fallback'
-      : 'ffmpeg_motion_compositor';
+  const enginePreference = normalizeRenderEnginePreference(raw.enginePreference);
 
   const revisionNote =
     typeof raw.revisionNote === 'string' ? raw.revisionNote.trim().slice(0, 400) : '';
+
+  const retryFailedShotsOnly = raw.retryFailedShotsOnly === true;
 
   return {
     valid: true,
@@ -267,8 +385,235 @@ export function validateRenderRequest(
       includeSubtitles,
       enginePreference,
       revisionNote: revisionNote || undefined,
+      retryFailedShotsOnly,
     },
     audioModeSummary: readiness.audioModeSummary,
+  };
+}
+
+/**
+ * Builds initial per-shot render state entries from a campaign's storyboard.
+ */
+export function createInitialShotRenderStates(
+  campaign: Campaign,
+  previousShotResults?: import('../types.ts').ShotRenderState[],
+  retryFailedShotsOnly = false,
+  nowIso = new Date().toISOString()
+): import('../types.ts').ShotRenderState[] {
+  const shots = campaign.storyboard?.shots || [];
+  return shots.map((shot) => {
+    const prev = previousShotResults?.find(
+      (p) =>
+        p.shotNumber === shot.shotNumber &&
+        p.durationSeconds === shot.durationSeconds &&
+        p.status === 'completed' &&
+        p.clipFileUrl
+    );
+    if (retryFailedShotsOnly && prev) {
+      return {
+        ...prev,
+        updatedAt: nowIso,
+      };
+    }
+    return {
+      shotNumber: shot.shotNumber,
+      shotType: shot.shotType,
+      durationSeconds: shot.durationSeconds,
+      status: 'queued',
+      attempts: prev?.attempts || 0,
+      updatedAt: nowIso,
+    };
+  });
+}
+
+/**
+ * Updates a single shot's state inside the shotResults array.
+ */
+export function updateShotRenderState(
+  shotResults: import('../types.ts').ShotRenderState[],
+  shotNumber: number,
+  patch: Partial<import('../types.ts').ShotRenderState>,
+  nowIso = new Date().toISOString()
+): import('../types.ts').ShotRenderState[] {
+  return shotResults.map((item) =>
+    item.shotNumber === shotNumber
+      ? {
+          ...item,
+          ...patch,
+          updatedAt: nowIso,
+        }
+      : item
+  );
+}
+
+/**
+ * Builds a high-precision commercial video generation prompt for a single storyboard shot,
+ * combining the product reference image identity, packaging/logo preservation rules,
+ * camera choreography, lighting, and scene movement.
+ */
+export function buildCommercialShotVideoPrompt(
+  campaign: Campaign,
+  shot: import('../types.ts').StoryboardShot
+): string {
+  const totalShots = campaign.storyboard?.shots?.length || 1;
+  const colorDesc = (campaign.productProfile?.dominantColors || [])
+    .map((c) => `${c.name} (${c.hex})`)
+    .join(', ');
+  const materialDesc = (campaign.productProfile?.materialsAndTextures || []).join(', ');
+  const fidelityRules = [
+    ...(campaign.productProfile?.visualFidelityConstraints || []),
+    shot.productFidelityNote || '',
+  ]
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join('; ');
+
+  return [
+    `Vertical 9:16 commercial product video clip for "${campaign.title}" by ${campaign.brandName || 'the brand'}.`,
+    `Shot ${shot.shotNumber} of ${totalShots} (${shot.shotType}, target duration ${shot.durationSeconds}s).`,
+    `Scene Action & Motion: ${shot.sceneDescription}`,
+    `Visual Direction (9:16 Vertical Framing): ${shot.visualPrompt9x16}`,
+    `Camera Choreography & Commercial Motion: ${shot.cameraMovement}. Include smooth cinematic camera motion, subtle 3D product depth, realistic specular highlights, and dynamic commercial lighting transitions (${campaign.visualStyle || 'studio commercial lighting'}).`,
+    `Product Identity & Reference Preservation: Use the attached product reference image as the exact hero subject. Preserve exact packaging proportions, silhouette, label typography (${campaign.visiblePackagingText || campaign.title}), materials (${materialDesc || 'authentic product materials'}), and color palette (${colorDesc || 'authentic product colors'}).`,
+    fidelityRules ? `Strict Fidelity Constraints: ${fidelityRules}` : '',
+    `Do not hallucinate distorted text, extra limbs, or altered brand logos. Maintain crisp 9:16 vertical composition suitable for Instagram Reels and YouTube Shorts.`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * Classifies an error thrown during AI video generation into a structured RenderFailureCategory
+ * with an honest, actionable user-facing message.
+ */
+export function classifyVideoGenerationError(
+  err: unknown,
+  providerLabel = 'Google Veo 2.0 (veo-2.0-generate-001)'
+): {
+  category: import('../types.ts').RenderFailureCategory;
+  retryable: boolean;
+  userMessage: string;
+} {
+  if (
+    err &&
+    typeof err === 'object' &&
+    'category' in err &&
+    'userMessage' in err &&
+    typeof (err as { category?: unknown }).category === 'string' &&
+    typeof (err as { userMessage?: unknown }).userMessage === 'string'
+  ) {
+    const norm = err as {
+      category: import('../types.ts').RenderFailureCategory;
+      retryable?: boolean;
+      userMessage: string;
+    };
+    return {
+      category: norm.category,
+      retryable: Boolean(norm.retryable),
+      userMessage: norm.userMessage,
+    };
+  }
+
+  const rawMessage = err instanceof Error ? err.message : String(err || 'Unknown video generation error');
+  const lower = rawMessage.toLowerCase();
+
+  if (lower.includes('aborted') || lower.includes('cancelled') || lower.includes('canceled')) {
+    return {
+      category: 'cancelled',
+      retryable: false,
+      userMessage: 'Video render job was cancelled by the user.',
+    };
+  }
+
+  if (
+    lower.includes('invalid mp4') ||
+    lower.includes('failed mp4') ||
+    lower.includes('incomplete mp4') ||
+    lower.includes('not a valid video') ||
+    lower.includes('non-video') ||
+    lower.includes('did not contain a valid video') ||
+    lower.includes('content-type') ||
+    lower.includes('zero duration')
+  ) {
+    return {
+      category: 'invalid_video_output',
+      retryable: false,
+      userMessage: `${providerLabel} returned an invalid or non-playable video payload: ${rawMessage}`,
+    };
+  }
+
+  if (
+    lower.includes('missing api key') ||
+    lower.includes('not configured') ||
+    lower.includes('not set') ||
+    lower.includes('https is required') ||
+    lower.includes('authentication is required') ||
+    lower.includes('401') ||
+    lower.includes('403') ||
+    lower.includes('unauthenticated') ||
+    lower.includes('invalid api key') ||
+    lower.includes('unauthorized')
+  ) {
+    return {
+      category: 'auth_or_missing_key',
+      retryable: false,
+      userMessage: `${providerLabel} configuration or authentication error: ${rawMessage}`,
+    };
+  }
+
+  if (
+    lower.includes('402') ||
+    lower.includes('payment required') ||
+    lower.includes('insufficient credits') ||
+    lower.includes('billing')
+  ) {
+    return {
+      category: 'paid_tier_required',
+      retryable: false,
+      userMessage: `${providerLabel} requires video-generation model access or an active billing tier: ${rawMessage}`,
+    };
+  }
+
+  if (lower.includes('429') || lower.includes('rate_limit_exceeded') || lower.includes('quota')) {
+    return {
+      category: 'quota_exceeded',
+      retryable: true,
+      userMessage: `${providerLabel} rate limit / quota exceeded (HTTP 429): ${rawMessage}`,
+    };
+  }
+
+  if (lower.includes('404') || lower.includes('not_found') || lower.includes('not found')) {
+    return {
+      category: 'model_unavailable',
+      retryable: false,
+      userMessage: `Requested video model or endpoint (${providerLabel}) returned HTTP 404: ${rawMessage}`,
+    };
+  }
+
+  if (
+    lower.includes('503') ||
+    lower.includes('500') ||
+    lower.includes('502') ||
+    lower.includes('504') ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand') ||
+    lower.includes('timeout') ||
+    lower.includes('timed out') ||
+    lower.includes('econnrefused') ||
+    lower.includes('enotfound') ||
+    lower.includes('fetch failed')
+  ) {
+    return {
+      category: 'transient_error',
+      retryable: true,
+      userMessage: `Transient video generation server error on ${providerLabel}: ${rawMessage}`,
+    };
+  }
+
+  return {
+    category: 'validation_error',
+    retryable: false,
+    userMessage: rawMessage,
   };
 }
 
@@ -294,6 +639,16 @@ export function createQueuedRenderJob(
   );
   const readiness = checkCampaignRenderReadiness(campaign);
   const contentFingerprint = computeCampaignContentFingerprint(campaign, settings);
+  const engineMeta = getEngineDisplayMetadata(settings.enginePreference);
+  const previousShotResults =
+    campaign.activeRenderJob?.shotResults ||
+    campaign.renderHistory?.[0]?.shotResults;
+  const shotResults = createInitialShotRenderStates(
+    campaign,
+    previousShotResults,
+    Boolean(settings.retryFailedShotsOnly),
+    nowIso
+  );
 
   return {
     id: jobId,
@@ -303,8 +658,12 @@ export function createQueuedRenderJob(
     progressPercent: 5,
     stageMessage: 'Render job queued and validated...',
     requestedEngine: settings.enginePreference,
-    engineUsed: 'ffmpeg_motion_compositor',
-    engineLabel: 'FFmpeg 9:16 Motion-Compositor (Fallback — Not AI Video)',
+    providerUsed: engineMeta.providerUsed,
+    modelUsed: engineMeta.modelUsed,
+    engineUsed: engineMeta.engineUsed,
+    engineLabel: engineMeta.engineLabel,
+    isAiVideoGenerated: engineMeta.isAiVideoGenerated,
+    shotResults,
     resolution: settings.resolution,
     width,
     height,
@@ -322,7 +681,7 @@ export function createQueuedRenderJob(
 }
 
 /**
- * Transitions a VideoRenderJob through queued -> processing -> completed | failed.
+ * Transitions a VideoRenderJob through queued -> processing/generating/stitching -> completed | failed | cancelled.
  */
 export function transitionRenderJobStatus(
   job: VideoRenderJob,
@@ -330,9 +689,14 @@ export function transitionRenderJobStatus(
     status?: VideoRenderJob['status'];
     progressPercent?: number;
     stageMessage?: string;
+    providerUsed?: import('../types.ts').AiVideoProviderId | 'ffmpeg_local';
+    modelUsed?: string;
     engineUsed?: RenderEngineUsed;
     engineLabel?: string;
+    isAiVideoGenerated?: boolean;
     omniFallbackReason?: string;
+    failureCategory?: import('../types.ts').RenderFailureCategory;
+    shotResults?: import('../types.ts').ShotRenderState[];
     durationSeconds?: number;
     videoFileUrl?: string;
     byteLength?: number;
@@ -350,9 +714,17 @@ export function transitionRenderJobStatus(
         ? Math.max(0, Math.min(100, Math.round(patch.progressPercent)))
         : job.progressPercent,
     stageMessage: patch.stageMessage ?? job.stageMessage,
+    providerUsed: patch.providerUsed ?? job.providerUsed,
+    modelUsed: patch.modelUsed ?? job.modelUsed,
     engineUsed: patch.engineUsed ?? job.engineUsed,
     engineLabel: patch.engineLabel ?? job.engineLabel,
+    isAiVideoGenerated:
+      typeof patch.isAiVideoGenerated === 'boolean'
+        ? patch.isAiVideoGenerated
+        : job.isAiVideoGenerated,
     omniFallbackReason: patch.omniFallbackReason ?? job.omniFallbackReason,
+    failureCategory: patch.failureCategory ?? job.failureCategory,
+    shotResults: patch.shotResults ?? job.shotResults,
     durationSeconds: patch.durationSeconds ?? job.durationSeconds,
     videoFileUrl: patch.videoFileUrl ?? job.videoFileUrl,
     mimeType: patch.videoFileUrl || job.videoFileUrl ? 'video/mp4' : job.mimeType,
@@ -361,6 +733,7 @@ export function transitionRenderJobStatus(
     updatedAt: now,
     completedAt:
       nextStatus === 'completed' || nextStatus === 'failed' ? now : job.completedAt,
+    cancelledAt: nextStatus === 'cancelled' ? now : job.cancelledAt,
   };
 }
 
