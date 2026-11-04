@@ -23,6 +23,7 @@ import {
   FALLBACK_NVIDIA_TEXT_MODEL,
   callNemotronChatCompletion,
   extractJsonFromText,
+  parseRobustJson,
   NemotronError,
   type NemotronChatMessage,
 } from './src/utils/nemotronClient.ts';
@@ -674,17 +675,17 @@ Strict Non-Fabrication & Extraction Rules:
             throw new Error(`Model ${candidateModel} returned an empty analysis response.`);
           }
 
-          const cleanJson = extractJsonFromText(completion.text);
           let rawParsed: unknown;
           try {
-            rawParsed = JSON.parse(cleanJson);
-          } catch {
-            throw new Error(`Model ${candidateModel} returned malformed JSON during product identification.`);
+            rawParsed = parseRobustJson(completion.text);
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            throw new Error(`Model ${candidateModel} returned malformed JSON during product identification: ${msg}`);
           }
 
           const validation = validateAndNormalizeProductProfile(rawParsed);
           if (!validation.valid || !validation.profile) {
-            throw new Error(validation.error || 'Failed to validate extracted product profile.');
+            throw new Error(validation.error || 'Failed to validate extracted product profile against schema.');
           }
 
           return validation.profile;

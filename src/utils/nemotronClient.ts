@@ -5,16 +5,17 @@
  * using the server-side NVIDIA_API_KEY environment variable.
  *
  * Handles:
- *  - Multimodal Vision Product Analysis (nvidia/nemotron-3.5-super-vl-120b-a12b)
+ *  - Multimodal Vision Product Analysis (meta/llama-3.2-11b-vision-instruct / meta/llama-3.2-90b-vision-instruct / nvidia/nemotron-3.5-super-vl-120b-a12b)
  *  - Script & Storyboard Generation (nvidia/llama-3.1-nemotron-70b-instruct)
  *  - Transient error retries with bounded exponential backoff
- *  - Strict JSON response extraction and validation
+ *  - Strict JSON response extraction and robust repair/parsing
  *  - Non-sensitive model probe and error categorization
  */
 
 export const DEFAULT_NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1';
 
-export const DEFAULT_NVIDIA_VISION_MODEL = 'nvidia/nemotron-3.5-super-vl-120b-a12b';
+export const DEFAULT_NVIDIA_VISION_MODEL = 'meta/llama-3.2-11b-vision-instruct';
+export const FALLBACK_NVIDIA_VISION_MODEL = 'meta/llama-3.2-90b-vision-instruct';
 export const DEFAULT_NVIDIA_TEXT_MODEL = 'nvidia/llama-3.1-nemotron-70b-instruct';
 export const FALLBACK_NVIDIA_TEXT_MODEL = 'nvidia/nemotron-4-340b-instruct';
 
@@ -112,24 +113,51 @@ export function isTransientNemotronStatus(status?: number, message?: string): bo
 }
 
 /**
- * Strips markdown code fences (```json ... ``` or ``` ...) and whitespace.
+ * Strips markdown code fences (```json ... ``` or ``` ...) and trims whitespace.
+ * Also includes robust fallback JSON object extraction.
  */
 export function extractJsonFromText(rawText: string): string {
-  if (!rawText) return '';
+  if (!rawText || typeof rawText !== 'string') return '';
   const trimmed = rawText.trim();
+  
+  // 1. Check for markdown code fences
   const fenceRegex = /^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i;
   const match = trimmed.match(fenceRegex);
-  if (match) {
-    return match[1].trim();
-  }
-  // Try locating first '{' and last '}'
-  const firstBrace = trimmed.indexOf('{');
-  const lastBrace = trimmed.lastIndexOf('}');
+  let candidate = match ? match[1].trim() : trimmed;
+
+  // 2. Locate first '{' and last '}'
+  const firstBrace = candidate.indexOf('{');
+  const lastBrace = candidate.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    return trimmed.slice(firstBrace, lastBrace + 1).trim();
+    candidate = candidate.slice(firstBrace, lastBrace + 1).trim();
   }
-  return trimmed;
+
+  return candidate;
 }
+
+/**
+ * Attempts to parse JSON safely, repairing trailing commas or unescaped quotes if needed.
+ */
+export function parseRobustJson(rawText: string): any {
+  const cleaned = extractJsonFromText(rawText);
+  if (!cleaned) {
+    throw new Error('Empty or unparseable JSON text received from model.');
+  }
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (err: unknown) {
+    // Attempt minor common repairs (e.g., trailing commas in arrays/objects)
+    try {
+      const repaired = cleaned.replace(/,\s*([}\]])/g, '$1');
+      return JSON.parse(repaired);
+    } catch {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Invalid JSON syntax from vision/text model: ${msg}. Raw response snippet: ${rawText.slice(0, 160)}`);
+    }
+  }
+}
+
 
 /**
  * Makes an OpenAI-compatible chat completion request to the NVIDIA NIM endpoint.
@@ -153,7 +181,7 @@ export async function callNemotronChatCompletion(
     messages,
     temperature: options.temperature ?? 0.2,
     top_p: options.top_p ?? 0.95,
-    max_tokens: options.max_tokens ?? 2048,
+    max_tokens: options.max_tokens ?? 3000,
   };
 
   if (options.responseFormatJson) {
@@ -206,6 +234,15 @@ export async function callNemotronChatCompletion(
           status: 429,
           message: `NVIDIA API rate limit reached: ${parsedError}.`,
           isTransient: true,
+        });
+      }
+
+      if (response.status === 404 || /deprecated|end of life|retired|not found/i.test(parsedError)) {
+        throw new NemotronError({
+          category: 'model_error',
+          status: response.status,
+          message: `NVIDIA model ${model} is retired, end-of-life, or not found: ${parsedError}. Please configure a valid active model.`,
+          isTransient: false,
         });
       }
 
@@ -266,55 +303,4 @@ export async function callNemotronChatCompletion(
   } finally {
     clearTimeout(timeoutHandle);
   }
-}
-
-/**
- * Executes an operation with exponential backoff and optional model fallback.
- */
-export async function executeWithNemotronFallback<T>(
-  operation: (modelId: string, attempt: number) => Promise<T>,
-  models: string[],
-  options: {
-    maxRetriesPerModel?: number;
-    baseDelayMs?: number;
-    maxDelayMs?: number;
-    sleepFn?: (ms: number) => Promise<void>;
-  } = {}
-): Promise<{ result: T; resolvedModel: string; attempts: number; latencyMs: number }> {
-  const maxRetries = options.maxRetriesPerModel ?? 2;
-  const baseDelay = options.baseDelayMs ?? 300;
-  const maxDelay = options.maxDelayMs ?? 1500;
-  const sleep = options.sleepFn ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-
-  let lastError: Error | null = null;
-  const startTime = Date.now();
-  let totalAttempts = 0;
-
-  for (const model of models) {
-    for (let attempt = 1; attempt <= 1 + maxRetries; attempt++) {
-      totalAttempts++;
-      try {
-        const result = await operation(model, attempt);
-        return {
-          result,
-          resolvedModel: model,
-          attempts: totalAttempts,
-          latencyMs: Date.now() - startTime,
-        };
-      } catch (err: unknown) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-        const isTransient =
-          err instanceof NemotronError ? err.isTransient : isTransientNemotronStatus(undefined, lastError.message);
-
-        if (isTransient && attempt <= maxRetries) {
-          const delay = Math.min(maxDelay, baseDelay * Math.pow(2, attempt - 1));
-          await sleep(delay);
-          continue;
-        }
-        break; // Next model in chain
-      }
-    }
-  }
-
-  throw lastError || new Error('All configured NVIDIA Nemotron models failed.');
 }

@@ -46,9 +46,9 @@ import {
   DEFAULT_NVIDIA_TEXT_MODEL,
   FALLBACK_NVIDIA_TEXT_MODEL,
   extractJsonFromText,
+  parseRobustJson,
   isTransientNemotronStatus,
   callNemotronChatCompletion,
-  executeWithNemotronFallback,
   NemotronError,
 } from '../src/utils/nemotronClient.ts';
 import type {
@@ -2506,6 +2506,48 @@ describe('Milestone 3 — 9:16 Video Rendering, MP4 Verification, Sync & Approva
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe('NVIDIA Nemotron Robustness & Retired Model Regression Suite', () => {
+  it('handles retired models, malformed JSON, and missing fields with actionable error reporting', async () => {
+    const mockRetiredModelFetch = (async () => {
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: 'Model nvidia/nemotron-nano-12b-v2-vl is retired and end of life.',
+          },
+        }),
+        { status: 404, headers: { 'Content-Type': 'application/json' } }
+      );
+    }) as typeof fetch;
+
+    await assert.rejects(
+      async () => {
+        await callNemotronChatCompletion(
+          [{ role: 'user', content: 'Test' }],
+          { model: 'nvidia/nemotron-nano-12b-v2-vl' },
+          { NVIDIA_API_KEY: 'nvapi-key' },
+          mockRetiredModelFetch
+        );
+      },
+      (err: unknown) => {
+        assert.equal(err instanceof NemotronError, true);
+        const nem = err as NemotronError;
+        assert.equal(nem.category, 'model_error');
+        assert.match(nem.message, /retired, end-of-life, or not found/);
+        return true;
+      }
+    );
+
+    const messyJsonText = 'Here is your JSON:\n```json\n{\n  "detectedProductName": "Espresso Pro",\n  "category": "Appliances",\n  "subcategory": "Coffee",\n  "identifiedBrandName": "Veloce",\n  "identifiedModelOrVariant": "Pro",\n  "visiblePriceOrOffer": "$649",\n  "visiblePackagingTextAndLogos": ["Veloce"],\n  "identificationConfidence": "high",\n  "uncertaintyNotes": "None",\n  "suggestedVisualDirection": "Studio",\n  "productSummary": "Summary",\n  "dominantColors": [],\n  "materialsAndTextures": [],\n  "estimatedDimensions": "30cm",\n  "detectedFeatures": [],\n  "keySellingPoints": [],\n  "brandVoiceGuidelines": { "toneDescriptors": [], "wordsToUse": [], "wordsToAvoid": [], "targetPersonaSummary": "Inferred: Baristas" },\n  "recommendedAdAngles": [],\n  "visualFidelityConstraints": [],\n}\n```';
+    const parsedObj = parseRobustJson(messyJsonText);
+    assert.equal(parsedObj.detectedProductName, 'Espresso Pro');
+
+    const incompleteProfile = { detectedProductName: 'Incomplete' };
+    const validation = validateAndNormalizeProductProfile(incompleteProfile);
+    assert.equal(validation.valid, false);
+    assert.match(validation.error || '', /Product identification incomplete/);
   });
 });
 
