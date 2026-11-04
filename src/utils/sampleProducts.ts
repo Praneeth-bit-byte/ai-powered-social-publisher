@@ -3,6 +3,8 @@ export interface SampleProductPreset {
   title: string;
   price: string;
   brandName: string;
+  modelOrVariant?: string;
+  visiblePackagingText?: string;
   brandVoice: string;
   targetAudience: string;
   visualStyle: string;
@@ -287,8 +289,10 @@ export const SAMPLE_PRODUCT_PRESETS: SampleProductPreset[] = [
     title: 'Veloce Barista Pro Dual-Boiler Espresso Machine',
     price: '$849.00',
     brandName: 'Veloce Milano',
+    modelOrVariant: 'Barista Pro · 9 Bar Dual Boiler',
+    visiblePackagingText: 'VELOCE BARISTA PRO · 9 BAR DUAL BOILER',
     brandVoice: 'Luxury & Editorial',
-    targetAudience: 'Home specialty coffee enthusiasts and design-conscious urban professionals',
+    targetAudience: 'Inferred: Home specialty coffee enthusiasts and design-conscious urban professionals',
     visualStyle: 'Warm architectural morning light, tactile brass and walnut close-ups, slow-motion espresso extraction',
     categoryHint: 'Kitchen Appliances · Specialty Coffee',
     renderCanvasImage: drawEspressoMachine,
@@ -298,8 +302,10 @@ export const SAMPLE_PRODUCT_PRESETS: SampleProductPreset[] = [
     title: 'Solaris 20% Vitamin C + Ferulic Cellular Radiance Elixir',
     price: '$68.00',
     brandName: 'Solaris Botanica',
+    modelOrVariant: '30 ML / 1.0 FL OZ Dropper Bottle',
+    visiblePackagingText: 'SOLARIS BOTANICA · 20% VITAMIN C + FERULIC · Cold-Pressed Sea Buckthorn · 30 ML / 1.0 FL OZ',
     brandVoice: 'Warm & Founder-Led',
-    targetAudience: 'Skincare-savvy millennials and Gen-Z shoppers seeking clean clinical glow without irritation',
+    targetAudience: 'Inferred: Skincare-savvy millennials and Gen-Z shoppers seeking clean clinical glow without irritation',
     visualStyle: 'Golden-hour limestone textures, dewy glass dropper macro shots, serene botanical studio aesthetic',
     categoryHint: 'Beauty & Skincare · Clinical Botanicals',
     renderCanvasImage: drawBotanicalSerum,
@@ -309,8 +315,10 @@ export const SAMPLE_PRODUCT_PRESETS: SampleProductPreset[] = [
     title: 'AeroPeak Carbon X3 Trail Running Shoe',
     price: '$215.00',
     brandName: 'AeroPeak Athletics',
+    modelOrVariant: 'Carbon X3 Trail',
+    visiblePackagingText: 'AEROPEAK CARBON X3',
     brandVoice: 'Technical & Performance',
-    targetAudience: 'Marathoners, ultra-trail runners, and outdoor endurance athletes',
+    targetAudience: 'Inferred: Marathoners, ultra-trail runners, and outdoor endurance athletes',
     visualStyle: 'High-contrast volcanic terrain, dynamic speed cuts, technical midsole & carbon-plate callouts',
     categoryHint: 'Athletic Footwear · Endurance Trail',
     renderCanvasImage: drawTrailRunningShoe,
