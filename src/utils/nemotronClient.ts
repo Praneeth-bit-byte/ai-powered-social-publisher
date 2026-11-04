@@ -14,7 +14,7 @@
 
 export const DEFAULT_NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1';
 
-export const DEFAULT_NVIDIA_VISION_MODEL = 'meta/llama-3.2-11b-vision-instruct';
+export const DEFAULT_NVIDIA_VISION_MODEL = 'nvidia/nemotron-3.5-super-vl-120b-a12b';
 export const FALLBACK_NVIDIA_VISION_MODEL = 'meta/llama-3.2-90b-vision-instruct';
 export const DEFAULT_NVIDIA_TEXT_MODEL = 'nvidia/llama-3.1-nemotron-70b-instruct';
 export const FALLBACK_NVIDIA_TEXT_MODEL = 'nvidia/nemotron-4-340b-instruct';
@@ -83,11 +83,19 @@ export function getNvidiaBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 export function getNvidiaVisionModel(env: NodeJS.ProcessEnv = process.env): string {
-  return (env.NVIDIA_VISION_MODEL || '').trim() || DEFAULT_NVIDIA_VISION_MODEL;
+  const raw = (env.NVIDIA_VISION_MODEL || '').trim();
+  if (!raw || /nemotron-nano-12b|11b-vision-instruct|deprecated|retired/i.test(raw)) {
+    return DEFAULT_NVIDIA_VISION_MODEL;
+  }
+  return raw;
 }
 
 export function getNvidiaTextModel(env: NodeJS.ProcessEnv = process.env): string {
-  return (env.NVIDIA_TEXT_MODEL || '').trim() || DEFAULT_NVIDIA_TEXT_MODEL;
+  const raw = (env.NVIDIA_TEXT_MODEL || '').trim();
+  if (!raw || /deprecated|retired/i.test(raw)) {
+    return DEFAULT_NVIDIA_TEXT_MODEL;
+  }
+  return raw;
 }
 
 /**
@@ -136,7 +144,7 @@ export function extractJsonFromText(rawText: string): string {
 }
 
 /**
- * Attempts to parse JSON safely, repairing trailing commas or unescaped quotes if needed.
+ * Attempts to parse JSON safely, repairing trailing commas or missing commas if needed.
  */
 export function parseRobustJson(rawText: string): any {
   const cleaned = extractJsonFromText(rawText);
@@ -147,9 +155,10 @@ export function parseRobustJson(rawText: string): any {
   try {
     return JSON.parse(cleaned);
   } catch (err: unknown) {
-    // Attempt minor common repairs (e.g., trailing commas in arrays/objects)
+    // Attempt minor common repairs (trailing commas, missing commas between elements)
     try {
-      const repaired = cleaned.replace(/,\s*([}\]])/g, '$1');
+      let repaired = cleaned.replace(/,\s*([}\]])/g, '$1');
+      repaired = repaired.replace(/(["}\d\]truefalsenull])\s*\n\s*(["{[]|[\dtruefalsenull-])/g, '$1,$2');
       return JSON.parse(repaired);
     } catch {
       const msg = err instanceof Error ? err.message : String(err);
