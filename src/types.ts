@@ -107,6 +107,60 @@ export interface BackgroundMusicState {
   updatedAt: string;
 }
 
+export type RenderJobStatus = 'queued' | 'processing' | 'completed' | 'failed';
+
+export type RenderEnginePreference = 'ffmpeg_motion_compositor' | 'auto_omni_with_ffmpeg_fallback';
+
+export type RenderEngineUsed = 'gemini_omni_video' | 'ffmpeg_motion_compositor';
+
+export interface VideoRenderSettings {
+  resolution: '1080x1920' | '720x1280';
+  includeSubtitles: boolean;
+  enginePreference: RenderEnginePreference;
+  revisionNote?: string;
+}
+
+export interface VideoRenderJob {
+  id: string;
+  campaignId: string;
+  versionNumber: number;
+  status: RenderJobStatus;
+  progressPercent: number;
+  stageMessage: string;
+  requestedEngine: RenderEnginePreference;
+  engineUsed: RenderEngineUsed;
+  engineLabel: string;
+  omniFallbackReason?: string;
+  resolution: '1080x1920' | '720x1280';
+  width: number;
+  height: number;
+  aspectRatio: '9:16';
+  fps: number;
+  durationSeconds: number;
+  targetDurationSeconds: number;
+  includeSubtitles: boolean;
+  audioModeSummary: string;
+  revisionNote?: string;
+  videoFileUrl?: string;
+  mimeType?: 'video/mp4';
+  byteLength?: number;
+  contentFingerprint: string;
+  errorMessage?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+}
+
+export interface VideoApprovalState {
+  status: 'unrendered' | 'pending_review' | 'approved' | 'rejected' | 'invalidated';
+  renderJobId?: string;
+  versionNumber?: number;
+  reviewedAt?: string;
+  rejectionReason?: string;
+  invalidationReason?: string;
+  contentFingerprintAtReview?: string;
+}
+
 export interface Campaign {
   id: string;
   title: string;
@@ -130,7 +184,17 @@ export interface Campaign {
   storyboard?: VideoConceptAndStoryboard;
   voiceover?: VoiceoverAudioAsset;
   backgroundMusic?: BackgroundMusicState;
-  status: 'analyzed' | 'storyboard_ready' | 'audio_ready';
+  activeRenderJob?: VideoRenderJob;
+  latestCompletedRender?: VideoRenderJob;
+  renderHistory?: VideoRenderJob[];
+  approval?: VideoApprovalState;
+  status:
+    | 'analyzed'
+    | 'storyboard_ready'
+    | 'audio_ready'
+    | 'rendering_video'
+    | 'video_ready'
+    | 'approved_for_publish';
   createdAt: string;
   updatedAt: string;
 }
@@ -153,3 +217,4 @@ export interface ModelVerificationReport {
   recommendedTtsModel: string;
   models: ModelProbeEntry[];
 }
+

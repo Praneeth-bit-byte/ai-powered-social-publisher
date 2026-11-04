@@ -6,9 +6,11 @@ import type {
   ColorSwatch,
   SellingPoint,
   RecommendedAdAngle,
+  VideoRenderSettings,
 } from '../types.ts';
 import type { SampleProductPreset } from './sampleProducts.ts';
 import { VOICE_OPTIONS_META } from './milestone2Validators.ts';
+import { DEFAULT_RENDER_SETTINGS } from './milestone3Validators.ts';
 
 export interface StudioFormState {
   title: string;
@@ -37,15 +39,19 @@ export interface StudioSessionState {
   voiceStylePrompt: string;
   voiceScriptDraft: string;
   musicPromptDraft: string;
+  renderSettings: VideoRenderSettings;
+  rejectionReasonDraft: string;
   isAnalyzing: boolean;
   isSavingProfile: boolean;
   isGeneratingStoryboard: boolean;
   isSavingStoryboard: boolean;
   isGeneratingVoiceover: boolean;
   isProcessingMusic: boolean;
+  isRenderingVideo: boolean;
+  isSubmittingApproval: boolean;
   hasUnsavedProfileEdits: boolean;
   hasUnsavedStoryboardEdits: boolean;
-  lastRetryAction: 'analyze' | 'storyboard' | 'voiceover' | null;
+  lastRetryAction: 'analyze' | 'storyboard' | 'voiceover' | 'render' | null;
   warningBanner: string | null;
   errorBanner: string | null;
   statusMessage: string | null;
@@ -429,12 +435,16 @@ export function createBlankStudioState(): StudioSessionState {
     voiceStylePrompt: '',
     voiceScriptDraft: '',
     musicPromptDraft: '',
+    renderSettings: { ...DEFAULT_RENDER_SETTINGS },
+    rejectionReasonDraft: '',
     isAnalyzing: false,
     isSavingProfile: false,
     isGeneratingStoryboard: false,
     isSavingStoryboard: false,
     isGeneratingVoiceover: false,
     isProcessingMusic: false,
+    isRenderingVideo: false,
+    isSubmittingApproval: false,
     hasUnsavedProfileEdits: false,
     hasUnsavedStoryboardEdits: false,
     lastRetryAction: null,
@@ -563,6 +573,7 @@ export function applyCampaignToStudioState(campaign: Campaign): StudioSessionSta
   };
 
   const mappedForm = mapExtractedProfileToForm(emptyFormWithImage, clonedProfile);
+  const latestRender = campaign.latestCompletedRender || campaign.activeRenderJob;
 
   return {
     ...blank,
@@ -587,6 +598,20 @@ export function applyCampaignToStudioState(campaign: Campaign): StudioSessionSta
     voiceStylePrompt: campaign.voiceover?.voiceStyle || defaultVoiceMeta.defaultStylePrompt,
     voiceScriptDraft: defaultScript,
     musicPromptDraft: defaultMusicPrompt,
+    renderSettings: {
+      resolution: latestRender?.resolution || DEFAULT_RENDER_SETTINGS.resolution,
+      includeSubtitles:
+        typeof latestRender?.includeSubtitles === 'boolean'
+          ? latestRender.includeSubtitles
+          : DEFAULT_RENDER_SETTINGS.includeSubtitles,
+      enginePreference:
+        latestRender?.requestedEngine || DEFAULT_RENDER_SETTINGS.enginePreference,
+      revisionNote: '',
+    },
+    rejectionReasonDraft: campaign.approval?.rejectionReason || '',
+    isRenderingVideo:
+      campaign.activeRenderJob?.status === 'queued' ||
+      campaign.activeRenderJob?.status === 'processing',
   };
 }
 
@@ -608,8 +633,27 @@ export function handleVoiceoverErrorState(
 }
 
 /**
- * Merges a campaign update from voiceover or music endpoints without overwriting
- * any unsaved in-memory profile or storyboard edits made by the user.
+ * Handles a 9:16 video rendering error while strictly preserving all campaign,
+ * storyboard, script, audio, and render settings in memory.
+ */
+export function handleRenderErrorState(
+  prevState: StudioSessionState,
+  errorMessage: string,
+  updatedCampaign?: Campaign
+): StudioSessionState {
+  return {
+    ...prevState,
+    activeCampaign: updatedCampaign || prevState.activeCampaign,
+    isRenderingVideo: false,
+    statusMessage: null,
+    lastRetryAction: 'render',
+    errorBanner: errorMessage,
+  };
+}
+
+/**
+ * Merges a campaign update from voiceover, music, video render, or approval endpoints
+ * without overwriting any unsaved in-memory profile or storyboard edits made by the user.
  */
 export function applyVoiceoverOrMusicUpdatePreservingEdits(
   prevState: StudioSessionState,
@@ -637,6 +681,8 @@ export function applyVoiceoverOrMusicUpdatePreservingEdits(
     voiceStylePrompt: updatedCampaign.voiceover?.voiceStyle || prevState.voiceStylePrompt,
     voiceScriptDraft: prevState.voiceScriptDraft || baseState.voiceScriptDraft,
     musicPromptDraft: prevState.musicPromptDraft || baseState.musicPromptDraft,
+    renderSettings: prevState.renderSettings,
+    rejectionReasonDraft: prevState.rejectionReasonDraft,
   };
 }
 

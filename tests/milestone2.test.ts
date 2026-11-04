@@ -1075,4 +1075,579 @@ describe('Storyboard Model Routing, Bounded Backoff & Verified Fallback Suite', 
   });
 });
 
+describe('Milestone 3 — 9:16 Video Rendering, MP4 Verification, Sync & Approval Gate Suite', () => {
+  it('validates render requests, prevents path traversal, and blocks duplicate concurrent render jobs', async () => {
+    const {
+      isSafeIdentifier,
+      isSafeVideoFilename,
+      validateRenderRequest,
+      canStartNewRenderJob,
+      createQueuedRenderJob,
+    } = await import('../src/utils/milestone3Validators.ts');
+
+    // Path traversal & identifier checks
+    assert.equal(isSafeIdentifier('camp_espresso_01'), true);
+    assert.equal(isSafeIdentifier('../etc/passwd'), false);
+    assert.equal(isSafeIdentifier('camp/../../secret'), false);
+    assert.equal(isSafeVideoFilename('render_camp_01_job_01.mp4'), true);
+    assert.equal(isSafeVideoFilename('../render_camp_01_job_01.mp4'), false);
+    assert.equal(isSafeVideoFilename('render_camp_01_job_01.avi'), false);
+
+    const readyCampaign: Campaign = {
+      id: 'camp_m3_ready',
+      createdAt: '2026-11-04T00:00:00.000Z',
+      updatedAt: '2026-11-04T00:05:00.000Z',
+      status: 'audio_ready',
+      title: 'Veloce Barista Pro',
+      price: '$649',
+      brandName: 'Veloce Milano',
+      modelOrVariant: 'Pro 9-Bar',
+      visiblePackagingText: 'VELOCE',
+      brandVoice: 'Luxury',
+      targetAudience: 'Inferred: Home baristas',
+      visualStyle: 'Warm studio light',
+      imageDataUrl:
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      analysisMetadata: {
+        requestedModel: 'gemini-3.1-flash-lite',
+        resolvedModel: 'gemini-3.1-flash-lite',
+        fallbackUsed: false,
+        latencyMs: 400,
+        analyzedAt: '2026-11-04T00:00:00.000Z',
+      },
+      productProfile: {
+        detectedProductName: 'Veloce Barista Pro',
+        category: 'Appliances',
+        subcategory: 'Espresso',
+        productSummary: 'Dual boiler espresso maker.',
+        dominantColors: [{ name: 'Obsidian', hex: '#1C1917', usageRole: 'Chassis' }],
+        materialsAndTextures: ['Steel'],
+        estimatedDimensions: '30cm',
+        detectedFeatures: ['9-bar gauge'],
+        keySellingPoints: [
+          { headline: '9-Bar Extraction', proofPoint: 'Brass gauge', emotionalHook: 'Cafe crema' },
+        ],
+        brandVoiceGuidelines: {
+          toneDescriptors: ['Warm'],
+          wordsToUse: ['crema'],
+          wordsToAvoid: ['cheap'],
+          targetPersonaSummary: 'Inferred: Home baristas',
+        },
+        recommendedAdAngles: [],
+        visualFidelityConstraints: ['Preserve brass gauge'],
+      },
+      storyboard: {
+        conceptTitle: '9-Bar Morning Ritual',
+        targetPlatformFormat: 'Instagram Reels (9:16)',
+        totalDurationSeconds: 4,
+        openingHook3s: 'Stop settling for bitter coffee.',
+        fullVoiceoverScript: 'Stop settling for bitter coffee. Meet Veloce Barista Pro.',
+        estimatedWordCount: 9,
+        brandSafetyVerification: ['Verified'],
+        masterCinematicPrompt9x16: 'Vertical 9:16 shot.',
+        musicDirectionPrompt: 'Warm acoustic',
+        shots: [
+          {
+            shotNumber: 1,
+            durationSeconds: 2,
+            timecodeRange: '00:00 - 00:02',
+            shotType: '01. Hook',
+            sceneDescription: 'Brass pressure gauge rising to 9 bar.',
+            cameraMovement: 'Push-in',
+            visualPrompt9x16: '9:16 macro gauge.',
+            onScreenTextOverlay: '9-Bar Precision',
+            spokenVoiceoverSegment: 'Stop settling for bitter coffee.',
+            productFidelityNote: 'Preserve brass dial.',
+          },
+          {
+            shotNumber: 2,
+            durationSeconds: 2,
+            timecodeRange: '00:02 - 00:04',
+            shotType: '02. Hero',
+            sceneDescription: 'Espresso pouring into cup.',
+            cameraMovement: 'Tracking',
+            visualPrompt9x16: '9:16 crema pour.',
+            onScreenTextOverlay: 'Veloce Barista Pro',
+            spokenVoiceoverSegment: 'Meet Veloce Barista Pro.',
+            productFidelityNote: 'Preserve walnut portafilter.',
+          },
+        ],
+        generationMetadata: {
+          requestedModel: 'gemini-3.1-flash-lite',
+          resolvedModel: 'gemini-3.1-flash-lite',
+          fallbackUsed: false,
+          latencyMs: 500,
+          generatedAt: '2026-11-04T00:02:00.000Z',
+        },
+      },
+      voiceover: {
+        id: 'vo_m3_01',
+        voiceName: 'Kore',
+        voiceStyle: 'Warm narrator',
+        scriptTextUsed: 'Stop settling for bitter coffee. Meet Veloce Barista Pro.',
+        audioFileUrl: '/api/audio/voiceover-camp_m3_ready.wav',
+        mimeType: 'audio/wav',
+        byteLength: 192044,
+        sampleRateHz: 24000,
+        durationEstimateSeconds: 4.0,
+        resolvedModel: PRIMARY_TTS_MODEL,
+        latencyMs: 800,
+        generatedAt: '2026-11-04T00:03:00.000Z',
+      },
+    };
+
+    const validReq = validateRenderRequest(
+      {
+        resolution: '1080x1920',
+        includeSubtitles: true,
+        enginePreference: 'ffmpeg_motion_compositor',
+      },
+      readyCampaign
+    );
+    assert.equal(validReq.valid, true);
+    assert.equal(validReq.settings?.resolution, '1080x1920');
+
+    // Duplicate concurrent job guard
+    const queuedJob = createQueuedRenderJob(readyCampaign, validReq.settings!, 'job_m3_01');
+    const campaignWithActiveJob: Campaign = {
+      ...readyCampaign,
+      activeRenderJob: queuedJob,
+    };
+    const duplicateCheck = canStartNewRenderJob(campaignWithActiveJob);
+    assert.equal(duplicateCheck.allowed, false);
+    assert.match(duplicateCheck.error || '', /already queued/);
+
+    const duplicateReq = validateRenderRequest({}, campaignWithActiveJob);
+    assert.equal(duplicateReq.valid, false);
+    assert.match(duplicateReq.error || '', /already queued/);
+  });
+
+  it('transitions render job states (queued -> processing -> completed / failed) and preserves campaign edits on failure', async () => {
+    const {
+      DEFAULT_RENDER_SETTINGS,
+      createQueuedRenderJob,
+      transitionRenderJobStatus,
+    } = await import('../src/utils/milestone3Validators.ts');
+    const { handleRenderErrorState } = await import('../src/utils/studioState.ts');
+
+    const mockPreset = applyPresetToStudioState(
+      SAMPLE_PRODUCT_PRESETS[0],
+      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
+    );
+    const dummyCampaign: Campaign = {
+      id: 'camp_lifecycle',
+      createdAt: '2026-11-04T00:00:00.000Z',
+      updatedAt: '2026-11-04T00:00:00.000Z',
+      status: 'audio_ready',
+      title: mockPreset.form.title,
+      price: mockPreset.form.price,
+      brandName: mockPreset.form.brandName,
+      modelOrVariant: mockPreset.form.modelOrVariant,
+      visiblePackagingText: mockPreset.form.visiblePackagingText,
+      brandVoice: mockPreset.form.brandVoice,
+      targetAudience: mockPreset.form.targetAudience,
+      visualStyle: mockPreset.form.visualStyle,
+      imageDataUrl: mockPreset.form.imageDataUrl,
+      analysisMetadata: {
+        requestedModel: 'gemini-3.1-flash-lite',
+        resolvedModel: 'gemini-3.1-flash-lite',
+        fallbackUsed: false,
+        latencyMs: 300,
+        analyzedAt: '2026-11-04T00:00:00.000Z',
+      },
+      productProfile: {
+        detectedProductName: mockPreset.form.title,
+        category: 'Appliances',
+        subcategory: 'Espresso',
+        productSummary: 'Summary',
+        dominantColors: [],
+        materialsAndTextures: [],
+        estimatedDimensions: '30cm',
+        detectedFeatures: [],
+        keySellingPoints: [],
+        brandVoiceGuidelines: {
+          toneDescriptors: [],
+          wordsToUse: [],
+          wordsToAvoid: [],
+          targetPersonaSummary: 'Inferred: Coffee lovers',
+        },
+        recommendedAdAngles: [],
+        visualFidelityConstraints: [],
+      },
+    };
+
+    const queued = createQueuedRenderJob(dummyCampaign, DEFAULT_RENDER_SETTINGS, 'job_lifecycle_1');
+    assert.equal(queued.status, 'queued');
+    assert.equal(queued.progressPercent, 5);
+
+    const processing = transitionRenderJobStatus(queued, {
+      status: 'processing',
+      progressPercent: 45,
+      stageMessage: 'Compositing Shot 2...',
+    });
+    assert.equal(processing.status, 'processing');
+    assert.equal(processing.progressPercent, 45);
+    assert.ok(processing.updatedAt);
+
+    const completed = transitionRenderJobStatus(processing, {
+      status: 'completed',
+      progressPercent: 100,
+      videoFileUrl: '/api/video/render_camp_lifecycle_job_lifecycle_1.mp4',
+      byteLength: 250000,
+      durationSeconds: 15,
+    });
+    assert.equal(completed.status, 'completed');
+    assert.equal(completed.progressPercent, 100);
+    assert.ok(completed.completedAt);
+
+    const failed = transitionRenderJobStatus(processing, {
+      status: 'failed',
+      errorMessage: 'FFmpeg exited with code 1',
+    });
+    assert.equal(failed.status, 'failed');
+    assert.equal(failed.errorMessage, 'FFmpeg exited with code 1');
+
+    // Verify studio state preserves unsaved storyboard & profile edits when render fails
+    const stateBeforeRender = createBlankStudioState();
+    stateBeforeRender.form.title = 'Unsaved Custom Product Title';
+    stateBeforeRender.hasUnsavedProfileEdits = true;
+    stateBeforeRender.hasUnsavedStoryboardEdits = true;
+    stateBeforeRender.isRenderingVideo = true;
+
+    const stateAfterRenderError = handleRenderErrorState(
+      stateBeforeRender,
+      'Video rendering failed due to corrupted audio track.'
+    );
+    assert.equal(stateAfterRenderError.isRenderingVideo, false);
+    assert.equal(stateAfterRenderError.lastRetryAction, 'render');
+    assert.equal(stateAfterRenderError.form.title, 'Unsaved Custom Product Title');
+    assert.equal(stateAfterRenderError.hasUnsavedProfileEdits, true);
+    assert.equal(stateAfterRenderError.hasUnsavedStoryboardEdits, true);
+  });
+
+  it('renders a genuine 9:16 vertical H.264/AAC MP4 file from product image, storyboard shots, and 24kHz WAV voiceover and verifies A/V sync', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const os = await import('node:os');
+    const {
+      DEFAULT_RENDER_SETTINGS,
+      verifyPlayableMp4Buffer,
+      verifyAudioVideoDurationSync,
+    } = await import('../src/utils/milestone3Validators.ts');
+    const { renderCampaignVerticalVideo, probeRenderedVideoFile } = await import(
+      '../src/utils/videoRenderer.ts'
+    );
+
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-ad-studio-m3-test-'));
+    const audioDir = path.join(tmpRoot, 'audio');
+    const videosDir = path.join(tmpRoot, 'videos');
+    fs.mkdirSync(audioDir, { recursive: true });
+    fs.mkdirSync(videosDir, { recursive: true });
+
+    try {
+      // Create a real 3.0-second 24kHz 16-bit mono WAV file (24000 * 2 * 3 = 144000 bytes PCM)
+      const pcm3s = Buffer.alloc(24000 * 2 * 3, 0);
+      const wav3s = ensureValidWavBuffer(pcm3s, 24000, 1, 16);
+      const voFilename = 'voiceover-camp_real_mp4.wav';
+      fs.writeFileSync(path.join(audioDir, voFilename), wav3s);
+
+      const testCampaign: Campaign = {
+        id: 'camp_real_mp4',
+        createdAt: '2026-11-04T00:00:00.000Z',
+        updatedAt: '2026-11-04T00:05:00.000Z',
+        status: 'audio_ready',
+        title: 'Veloce Barista Pro Espresso',
+        price: '$649',
+        brandName: 'Veloce Milano',
+        modelOrVariant: '9-Bar Dual Boiler',
+        visiblePackagingText: 'VELOCE MILANO',
+        brandVoice: 'Luxury & Editorial',
+        targetAudience: 'Inferred: Specialty coffee lovers',
+        visualStyle: 'Warm studio lighting',
+        imageDataUrl:
+          'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        analysisMetadata: {
+          requestedModel: 'gemini-3.1-flash-lite',
+          resolvedModel: 'gemini-3.1-flash-lite',
+          fallbackUsed: false,
+          latencyMs: 320,
+          analyzedAt: '2026-11-04T00:00:00.000Z',
+        },
+        productProfile: {
+          detectedProductName: 'Veloce Barista Pro Espresso',
+          category: 'Kitchen Appliances',
+          subcategory: 'Espresso Makers',
+          productSummary: 'Matte obsidian dual-boiler espresso machine.',
+          dominantColors: [
+            { name: 'Matte Obsidian', hex: '#1C1917', usageRole: 'Body' },
+            { name: 'Warm Brass', hex: '#D97706', usageRole: 'Gauge' },
+          ],
+          materialsAndTextures: ['Brushed steel', 'Walnut wood'],
+          estimatedDimensions: '32cm x 28cm',
+          detectedFeatures: ['9-bar brass gauge'],
+          keySellingPoints: [],
+          brandVoiceGuidelines: {
+            toneDescriptors: ['Refined'],
+            wordsToUse: ['crema'],
+            wordsToAvoid: ['instant'],
+            targetPersonaSummary: 'Inferred: Coffee enthusiasts',
+          },
+          recommendedAdAngles: [],
+          visualFidelityConstraints: ['Preserve matte obsidian finish and brass gauge'],
+        },
+        storyboard: {
+          conceptTitle: '9-Bar Morning Ritual',
+          targetPlatformFormat: 'Instagram Reels (9:16)',
+          totalDurationSeconds: 3,
+          openingHook3s: 'Stop settling for bitter morning coffee.',
+          fullVoiceoverScript: 'Stop settling for bitter morning coffee. Experience 9-bar crema.',
+          estimatedWordCount: 9,
+          brandSafetyVerification: ['Verified'],
+          masterCinematicPrompt9x16: 'Vertical 9:16 commercial.',
+          musicDirectionPrompt: 'Acoustic groove',
+          shots: [
+            {
+              shotNumber: 1,
+              durationSeconds: 1,
+              timecodeRange: '00:00 - 00:01',
+              shotType: '01. Macro Hook',
+              sceneDescription: 'Brass pressure gauge rising to 9 bar.',
+              cameraMovement: 'Slow push-in',
+              visualPrompt9x16: '9:16 macro gauge.',
+              onScreenTextOverlay: '9-Bar Precision',
+              spokenVoiceoverSegment: 'Stop settling for bitter morning coffee.',
+              productFidelityNote: 'Preserve brass dial.',
+            },
+            {
+              shotNumber: 2,
+              durationSeconds: 2,
+              timecodeRange: '00:01 - 00:03',
+              shotType: '02. Crema Pour',
+              sceneDescription: 'Rich tiger-stripe espresso extraction.',
+              cameraMovement: 'Low angle',
+              visualPrompt9x16: '9:16 crema extraction.',
+              onScreenTextOverlay: 'Veloce Barista Pro · $649',
+              spokenVoiceoverSegment: 'Experience 9-bar crema.',
+              productFidelityNote: 'Preserve walnut portafilter.',
+            },
+          ],
+          generationMetadata: {
+            requestedModel: 'gemini-3.1-flash-lite',
+            resolvedModel: 'gemini-3.1-flash-lite',
+            fallbackUsed: false,
+            latencyMs: 410,
+            generatedAt: '2026-11-04T00:02:00.000Z',
+          },
+        },
+        voiceover: {
+          id: 'vo_real_mp4',
+          voiceName: 'Kore',
+          voiceStyle: 'Warm narrator',
+          scriptTextUsed: 'Stop settling for bitter morning coffee. Experience 9-bar crema.',
+          audioFileUrl: `/api/audio/${voFilename}`,
+          mimeType: 'audio/wav',
+          byteLength: wav3s.length,
+          sampleRateHz: 24000,
+          durationEstimateSeconds: 3.0,
+          resolvedModel: PRIMARY_TTS_MODEL,
+          latencyMs: 700,
+          generatedAt: '2026-11-04T00:03:00.000Z',
+        },
+      };
+
+      const renderResult = await renderCampaignVerticalVideo({
+        campaign: testCampaign,
+        settings: {
+          ...DEFAULT_RENDER_SETTINGS,
+          resolution: '1080x1920',
+          includeSubtitles: true,
+        },
+        jobId: 'job_real_mp4_v1',
+        audioDir,
+        videosDir,
+      });
+
+      assert.equal(renderResult.engineUsed, 'ffmpeg_motion_compositor');
+      assert.match(renderResult.engineLabel, /FFmpeg 9:16 Motion-Compositor/);
+      assert.equal(renderResult.width, 1080);
+      assert.equal(renderResult.height, 1920);
+      assert.ok(fs.existsSync(renderResult.outputFilePath));
+
+      const mp4Buffer = fs.readFileSync(renderResult.outputFilePath);
+      const mp4Check = verifyPlayableMp4Buffer(mp4Buffer);
+      assert.equal(mp4Check.valid, true);
+
+      const probe = await probeRenderedVideoFile(renderResult.outputFilePath);
+      assert.equal(probe.width, 1080);
+      assert.equal(probe.height, 1920);
+      assert.equal(probe.videoCodec, 'h264');
+      assert.equal(probe.audioCodec, 'aac');
+
+      const syncCheck = verifyAudioVideoDurationSync({
+        targetDurationSeconds: 3,
+        videoDurationSeconds: probe.videoDurationSeconds,
+        audioDurationSeconds: probe.audioDurationSeconds,
+        toleranceSeconds: 1.0,
+      });
+      assert.equal(syncCheck.synchronized, true);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('approves and rejects rendered videos and automatically invalidates approval when campaign content or settings change', async () => {
+    const {
+      DEFAULT_RENDER_SETTINGS,
+      computeCampaignContentFingerprint,
+      createQueuedRenderJob,
+      transitionRenderJobStatus,
+      applyApprovalDecision,
+      invalidateApprovalOnCampaignChange,
+    } = await import('../src/utils/milestone3Validators.ts');
+
+    const baseCampaign: Campaign = {
+      id: 'camp_approval_test',
+      createdAt: '2026-11-04T00:00:00.000Z',
+      updatedAt: '2026-11-04T00:05:00.000Z',
+      status: 'video_ready',
+      title: 'Solaris Radiance Elixir',
+      price: '$58',
+      brandName: 'Solaris Botanica',
+      modelOrVariant: '30 ML',
+      visiblePackagingText: 'SOLARIS',
+      brandVoice: 'Clinical',
+      targetAudience: 'Inferred: Skincare enthusiasts',
+      visualStyle: 'Golden hour',
+      imageDataUrl: 'data:image/png;base64,TEST',
+      analysisMetadata: {
+        requestedModel: 'gemini-3.1-flash-lite',
+        resolvedModel: 'gemini-3.1-flash-lite',
+        fallbackUsed: false,
+        latencyMs: 300,
+        analyzedAt: '2026-11-04T00:00:00.000Z',
+      },
+      productProfile: {
+        detectedProductName: 'Solaris Radiance Elixir',
+        category: 'Skincare',
+        subcategory: 'Serum',
+        productSummary: 'Vitamin C serum.',
+        dominantColors: [],
+        materialsAndTextures: [],
+        estimatedDimensions: '30ml',
+        detectedFeatures: [],
+        keySellingPoints: [],
+        brandVoiceGuidelines: {
+          toneDescriptors: [],
+          wordsToUse: [],
+          wordsToAvoid: [],
+          targetPersonaSummary: 'Inferred: Skincare users',
+        },
+        recommendedAdAngles: [],
+        visualFidelityConstraints: [],
+      },
+      storyboard: {
+        conceptTitle: 'Golden Hour Radiance',
+        targetPlatformFormat: 'Instagram Reels (9:16)',
+        totalDurationSeconds: 15,
+        openingHook3s: 'Three drops to morning radiance.',
+        fullVoiceoverScript: 'Three drops to morning radiance with Solaris.',
+        estimatedWordCount: 7,
+        brandSafetyVerification: ['Verified'],
+        masterCinematicPrompt9x16: '9:16 serum shot',
+        musicDirectionPrompt: 'Ambient',
+        shots: [
+          {
+            shotNumber: 1,
+            durationSeconds: 15,
+            timecodeRange: '00:00 - 00:15',
+            shotType: '01. Hero',
+            sceneDescription: 'Amber dropper bottle.',
+            cameraMovement: 'Push-in',
+            visualPrompt9x16: '9:16 dropper.',
+            onScreenTextOverlay: 'Solaris Elixir',
+            spokenVoiceoverSegment: 'Three drops to morning radiance with Solaris.',
+            productFidelityNote: 'Preserve amber glass.',
+          },
+        ],
+        generationMetadata: {
+          requestedModel: 'gemini-3.1-flash-lite',
+          resolvedModel: 'gemini-3.1-flash-lite',
+          fallbackUsed: false,
+          latencyMs: 400,
+          generatedAt: '2026-11-04T00:01:00.000Z',
+        },
+      },
+      voiceover: {
+        id: 'vo_solaris',
+        voiceName: 'Kore',
+        voiceStyle: 'Calm',
+        scriptTextUsed: 'Three drops to morning radiance with Solaris.',
+        audioFileUrl: '/api/audio/voiceover-camp_approval_test.wav',
+        mimeType: 'audio/wav',
+        byteLength: 48044,
+        sampleRateHz: 24000,
+        durationEstimateSeconds: 3.0,
+        resolvedModel: PRIMARY_TTS_MODEL,
+        latencyMs: 500,
+        generatedAt: '2026-11-04T00:02:00.000Z',
+      },
+    };
+
+    const queued = createQueuedRenderJob(
+      baseCampaign,
+      DEFAULT_RENDER_SETTINGS,
+      'job_approval_v1'
+    );
+    const completedRender = transitionRenderJobStatus(queued, {
+      status: 'completed',
+      progressPercent: 100,
+      videoFileUrl: '/api/video/render_camp_approval_test_job_approval_v1.mp4',
+      byteLength: 180000,
+      durationSeconds: 15,
+    });
+    baseCampaign.latestCompletedRender = completedRender;
+
+    // 1. Approve rendered video
+    const approveResult = applyApprovalDecision(baseCampaign, 'approve');
+    assert.equal(approveResult.valid, true);
+    assert.equal(approveResult.campaign?.approval?.status, 'approved');
+    assert.equal(approveResult.campaign?.approval?.renderJobId, completedRender.id);
+    assert.ok(approveResult.campaign?.approval?.reviewedAt);
+
+    const approvedCampaign = approveResult.campaign!;
+
+    // 2. Reject rendered video
+    const rejectResult = applyApprovalDecision(approvedCampaign, 'reject', 'Make Shot 1 faster');
+    assert.equal(rejectResult.valid, true);
+    assert.equal(rejectResult.campaign?.approval?.status, 'rejected');
+    assert.equal(rejectResult.campaign?.approval?.rejectionReason, 'Make Shot 1 faster');
+    assert.ok(rejectResult.campaign?.approval?.reviewedAt);
+
+    // 3. Re-approve, then edit storyboard/product/audio and verify automatic invalidation
+    const reApprovedCampaign = approveResult.campaign!;
+
+    const invalidated = invalidateApprovalOnCampaignChange(
+      reApprovedCampaign,
+      'Storyboard or script was edited after video approval.'
+    );
+    assert.equal(invalidated.status, 'video_ready');
+    assert.equal(invalidated.approval?.status, 'invalidated');
+    assert.match(invalidated.approval?.invalidationReason || '', /edited after video approval/);
+
+    // Also verify content fingerprint changes when storyboard script is edited
+    const fpBefore = computeCampaignContentFingerprint(reApprovedCampaign, DEFAULT_RENDER_SETTINGS);
+    const editedCampaign: Campaign = {
+      ...reApprovedCampaign,
+      storyboard: {
+        ...reApprovedCampaign.storyboard!,
+        openingHook3s: 'Updated 3-second hook text!',
+      },
+    };
+    const fpAfter = computeCampaignContentFingerprint(editedCampaign, DEFAULT_RENDER_SETTINGS);
+    assert.notEqual(fpBefore, fpAfter);
+  });
+});
+
+
+
 

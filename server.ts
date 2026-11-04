@@ -39,10 +39,21 @@ import {
   parseAndValidateGeneratedStoryboard,
   setVerifiedAvailableModels,
 } from './src/utils/modelRouter.ts';
+import {
+  isSafeIdentifier,
+  isSafeVideoFilename,
+  validateRenderRequest,
+  createQueuedRenderJob,
+  transitionRenderJobStatus,
+  applyApprovalDecision,
+  invalidateApprovalOnCampaignChange,
+} from './src/utils/milestone3Validators.ts';
+import { renderCampaignVerticalVideo } from './src/utils/videoRenderer.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const AUDIO_DIR = path.join(DATA_DIR, 'audio');
+const VIDEOS_DIR = path.join(DATA_DIR, 'videos');
 const CAMPAIGNS_FILE = path.join(DATA_DIR, 'campaigns.json');
 
 function ensureDataStore(): void {
@@ -51,6 +62,9 @@ function ensureDataStore(): void {
   }
   if (!fs.existsSync(AUDIO_DIR)) {
     fs.mkdirSync(AUDIO_DIR, { recursive: true });
+  }
+  if (!fs.existsSync(VIDEOS_DIR)) {
+    fs.mkdirSync(VIDEOS_DIR, { recursive: true });
   }
   if (!fs.existsSync(CAMPAIGNS_FILE)) {
     fs.writeFileSync(CAMPAIGNS_FILE, JSON.stringify([], null, 2), 'utf-8');
@@ -384,6 +398,54 @@ export async function createAppServer() {
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'no-cache');
     fs.createReadStream(filePath).pipe(res);
+  });
+
+  // Serve rendered 9:16 MP4 video files with strict filename validation and HTTP byte-range support
+  app.get('/api/video/:filename', (req: Request, res: Response) => {
+    const rawParam = String(req.params.filename || '');
+    if (!isSafeVideoFilename(rawParam)) {
+      res.status(400).json({ error: 'Invalid video filename.' });
+      return;
+    }
+
+    const resolvedVideosDir = path.resolve(VIDEOS_DIR);
+    const filePath = path.resolve(resolvedVideosDir, path.basename(rawParam));
+    if (!filePath.startsWith(resolvedVideosDir + path.sep)) {
+      res.status(400).json({ error: 'Unsafe video file path.' });
+      return;
+    }
+
+    if (!fs.existsSync(filePath)) {
+      res.status(404).json({ error: 'Rendered video file not found.' });
+      return;
+    }
+
+    const stat = fs.statSync(filePath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Cache-Control', 'no-cache');
+
+    if (range) {
+      const parts = range.replace(/bytes=/, '').split('-');
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start >= fileSize || end >= fileSize || start > end) {
+        res.status(416).setHeader('Content-Range', `bytes */${fileSize}`).end();
+        return;
+      }
+      const chunkSize = end - start + 1;
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+      res.setHeader('Content-Length', chunkSize);
+      fs.createReadStream(filePath, { start, end }).pipe(res);
+    } else {
+      res.status(200);
+      res.setHeader('Content-Length', fileSize);
+      fs.createReadStream(filePath).pipe(res);
+    }
   });
 
   // 1. Live Gemini Model & API Readiness Verification Endpoint
@@ -784,7 +846,8 @@ Strict Non-Fabrication & Extraction Rules:
         productProfile,
       } = req.body ?? {};
 
-      const updated: Campaign = {
+      const nowIso = new Date().toISOString();
+      const baseUpdated: Campaign = {
         ...existing,
         title: typeof title === 'string' ? title : existing.title,
         price: typeof price === 'string' ? price : existing.price,
@@ -799,8 +862,14 @@ Strict Non-Fabrication & Extraction Rules:
         targetAudience: typeof targetAudience === 'string' ? targetAudience : existing.targetAudience,
         visualStyle: typeof visualStyle === 'string' ? visualStyle : existing.visualStyle,
         productProfile: productProfile && typeof productProfile === 'object' ? productProfile : existing.productProfile,
-        updatedAt: new Date().toISOString(),
+        updatedAt: nowIso,
       };
+
+      const updated = invalidateApprovalOnCampaignChange(
+        baseUpdated,
+        'product profile or brand metadata was edited',
+        nowIso
+      );
 
       campaigns[index] = updated;
       writeCampaigns(campaigns);
@@ -947,21 +1016,28 @@ Strict Requirements:
         }
       );
 
+      const nowIso = new Date().toISOString();
       const storyboard = parseAndValidateGeneratedStoryboard(execution.result, chosenFormat, {
         requestedModel: execution.requestedModel,
         resolvedModel: execution.resolvedModel,
         fallbackUsed: execution.fallbackUsed,
         fallbackReason: execution.fallbackReason,
         latencyMs: execution.latencyMs,
-        generatedAt: new Date().toISOString(),
+        generatedAt: nowIso,
       });
 
-      const updatedCampaign: Campaign = {
+      const baseUpdated: Campaign = {
         ...campaign,
         storyboard,
         status: campaign.voiceover ? 'audio_ready' : 'storyboard_ready',
-        updatedAt: new Date().toISOString(),
+        updatedAt: nowIso,
       };
+
+      const updatedCampaign = invalidateApprovalOnCampaignChange(
+        baseUpdated,
+        'a new 9:16 storyboard was generated',
+        nowIso
+      );
 
       campaigns[index] = updatedCampaign;
       writeCampaigns(campaigns);
@@ -1000,12 +1076,19 @@ Strict Requirements:
         return;
       }
 
-      const updatedCampaign: Campaign = {
+      const nowIso = new Date().toISOString();
+      const baseUpdated: Campaign = {
         ...existing,
         storyboard: validation.storyboard,
         status: existing.voiceover ? 'audio_ready' : 'storyboard_ready',
-        updatedAt: new Date().toISOString(),
+        updatedAt: nowIso,
       };
+
+      const updatedCampaign = invalidateApprovalOnCampaignChange(
+        baseUpdated,
+        'storyboard shots or script were edited',
+        nowIso
+      );
 
       campaigns[index] = updatedCampaign;
       writeCampaigns(campaigns);
@@ -1103,6 +1186,7 @@ Strict Requirements:
       const filePath = path.join(AUDIO_DIR, filename);
       fs.writeFileSync(filePath, wavBuffer);
 
+      const nowIso = new Date().toISOString();
       const voiceoverAsset: VoiceoverAudioAsset = {
         id: `vo_${crypto.randomUUID().slice(0, 8)}`,
         voiceName,
@@ -1115,7 +1199,7 @@ Strict Requirements:
         durationEstimateSeconds,
         resolvedModel,
         latencyMs,
-        generatedAt: new Date().toISOString(),
+        generatedAt: nowIso,
       };
 
       const existing = campaigns[index];
@@ -1130,7 +1214,7 @@ Strict Requirements:
         }
       }
 
-      const updatedCampaign: Campaign = {
+      const baseUpdated: Campaign = {
         ...existing,
         storyboard: preservedStoryboard,
         voiceover: voiceoverAsset,
@@ -1138,11 +1222,17 @@ Strict Requirements:
           status: 'not_requested',
           statusMessage:
             'No background music generated yet. Lyria (lyria-3-clip-preview) requires a paid API key, or you can upload a custom royalty-free track.',
-          updatedAt: new Date().toISOString(),
+          updatedAt: nowIso,
         },
         status: 'audio_ready',
-        updatedAt: new Date().toISOString(),
+        updatedAt: nowIso,
       };
+
+      const updatedCampaign = invalidateApprovalOnCampaignChange(
+        baseUpdated,
+        'a new AI voiceover WAV was synthesized',
+        nowIso
+      );
 
       campaigns[index] = updatedCampaign;
       writeCampaigns(campaigns);
@@ -1187,11 +1277,16 @@ Strict Requirements:
           res.status(400).json({ error: built.error || 'Invalid music state.' });
           return;
         }
-        const updated: Campaign = {
+        const baseUpdated: Campaign = {
           ...existing,
           backgroundMusic: built.musicState,
           updatedAt: now,
         };
+        const updated = invalidateApprovalOnCampaignChange(
+          baseUpdated,
+          'background music mode was changed to Voiceover-Only',
+          now
+        );
         campaigns[index] = updated;
         writeCampaigns(campaigns);
         res.json({ campaign: updated });
@@ -1220,7 +1315,12 @@ Strict Requirements:
           ...built.musicState,
           audioFileUrl: `/api/audio/${filename}`,
         };
-        const updated: Campaign = { ...existing, backgroundMusic: musicState, updatedAt: now };
+        const baseUpdated: Campaign = { ...existing, backgroundMusic: musicState, updatedAt: now };
+        const updated = invalidateApprovalOnCampaignChange(
+          baseUpdated,
+          'a new custom background music track was uploaded',
+          now
+        );
         campaigns[index] = updated;
         writeCampaigns(campaigns);
         res.json({ campaign: updated });
@@ -1270,7 +1370,12 @@ Strict Requirements:
           updatedAt: now,
         };
 
-        const updated: Campaign = { ...existing, backgroundMusic: musicState, updatedAt: now };
+        const baseUpdated: Campaign = { ...existing, backgroundMusic: musicState, updatedAt: now };
+        const updated = invalidateApprovalOnCampaignChange(
+          baseUpdated,
+          'new AI background music was generated',
+          now
+        );
         campaigns[index] = updated;
         writeCampaigns(campaigns);
         res.status(201).json({ campaign: updated });
@@ -1294,7 +1399,239 @@ Strict Requirements:
     }
   });
 
-  // 9. Delete a Campaign
+  // 9. MILESTONE 3: Render 9:16 Vertical Video MP4 for Approved/Edited Storyboard
+  app.post('/api/campaigns/:id/render', async (req: Request, res: Response) => {
+    const { id } = req.params;
+    if (!isSafeIdentifier(id)) {
+      res.status(400).json({ error: 'Invalid campaign ID.' });
+      return;
+    }
+
+    const campaigns = readCampaigns();
+    const index = campaigns.findIndex((c) => c.id === id);
+    if (index === -1) {
+      res.status(404).json({ error: 'Campaign not found.' });
+      return;
+    }
+
+    let campaign = campaigns[index];
+
+    // If the user submitted updated storyboard edits along with the render request, validate & persist them first
+    if (req.body?.storyboard && typeof req.body.storyboard === 'object') {
+      const sbValidation = validateStoryboardUpdate(
+        req.body.storyboard,
+        campaign.storyboard?.generationMetadata
+      );
+      if (!sbValidation.valid || !sbValidation.storyboard) {
+        res.status(400).json({ error: sbValidation.error || 'Invalid storyboard data.' });
+        return;
+      }
+      campaign = {
+        ...campaign,
+        storyboard: sbValidation.storyboard,
+      };
+    }
+
+    const validation = validateRenderRequest(req.body, campaign);
+    if (!validation.valid || !validation.settings) {
+      const statusCode = validation.error?.includes('already') ? 409 : 400;
+      res.status(statusCode).json({ error: validation.error || 'Invalid render request.' });
+      return;
+    }
+
+    const settings = validation.settings;
+    const jobId = `job_${crypto.randomUUID().slice(0, 8)}`;
+    const nowIso = new Date().toISOString();
+    const queuedJob = createQueuedRenderJob(campaign, settings, jobId, nowIso);
+
+    // Persist queued state immediately so duplicate concurrent submissions are blocked
+    campaign = {
+      ...campaign,
+      activeRenderJob: queuedJob,
+      status: 'rendering_video',
+      updatedAt: nowIso,
+    };
+    campaigns[index] = campaign;
+    writeCampaigns(campaigns);
+
+    const updateProgressInStore = (progressPercent: number, stageMessage: string) => {
+      const latestList = readCampaigns();
+      const idx = latestList.findIndex((c) => c.id === id);
+      if (idx === -1) return;
+      const current = latestList[idx];
+      if (!current.activeRenderJob || current.activeRenderJob.id !== jobId) return;
+      current.activeRenderJob = transitionRenderJobStatus(current.activeRenderJob, {
+        status: 'processing',
+        progressPercent,
+        stageMessage,
+      });
+      current.updatedAt = new Date().toISOString();
+      latestList[idx] = current;
+      writeCampaigns(latestList);
+    };
+
+    try {
+      updateProgressInStore(10, 'Initializing 9:16 vertical video render job...');
+
+      const renderResult = await renderCampaignVerticalVideo({
+        campaign,
+        settings,
+        jobId,
+        videosDir: VIDEOS_DIR,
+        audioDir: AUDIO_DIR,
+        getGenAIClient: process.env.GEMINI_API_KEY ? getGenAIClient : undefined,
+        callbacks: {
+          onProgress: updateProgressInStore,
+        },
+      });
+
+      const finishedIso = new Date().toISOString();
+      const completedJob = transitionRenderJobStatus(queuedJob, {
+        status: 'completed',
+        progressPercent: 100,
+        stageMessage: `Rendered 9:16 MP4 (${renderResult.width}×${renderResult.height}, ${renderResult.durationSeconds}s, ${(renderResult.byteLength / 1024).toFixed(1)} KB). Ready for human preview and approval.`,
+        engineUsed: renderResult.engineUsed,
+        engineLabel: renderResult.engineLabel,
+        omniFallbackReason: renderResult.omniFallbackReason,
+        durationSeconds: renderResult.durationSeconds,
+        videoFileUrl: renderResult.videoFileUrl,
+        byteLength: renderResult.byteLength,
+        nowIso: finishedIso,
+      });
+
+      const freshCampaigns = readCampaigns();
+      const targetIdx = freshCampaigns.findIndex((c) => c.id === id);
+      const baseCampaign = targetIdx !== -1 ? freshCampaigns[targetIdx] : campaign;
+      const history = Array.isArray(baseCampaign.renderHistory) ? baseCampaign.renderHistory : [];
+
+      const updatedCampaign: Campaign = {
+        ...baseCampaign,
+        activeRenderJob: completedJob,
+        latestCompletedRender: completedJob,
+        renderHistory: [completedJob, ...history.filter((j) => j.id !== completedJob.id)],
+        approval: {
+          status: 'pending_review',
+          renderJobId: completedJob.id,
+          versionNumber: completedJob.versionNumber,
+          contentFingerprintAtReview: completedJob.contentFingerprint,
+        },
+        status: 'video_ready',
+        updatedAt: finishedIso,
+      };
+
+      if (targetIdx !== -1) {
+        freshCampaigns[targetIdx] = updatedCampaign;
+        writeCampaigns(freshCampaigns);
+      }
+
+      res.status(201).json({
+        campaign: updatedCampaign,
+        renderJob: completedJob,
+        warning: renderResult.omniFallbackReason,
+      });
+    } catch (renderErr: unknown) {
+      const errMsg =
+        renderErr instanceof Error ? renderErr.message : 'Failed to render 9:16 vertical MP4 video.';
+      const failedIso = new Date().toISOString();
+      const failedJob = transitionRenderJobStatus(queuedJob, {
+        status: 'failed',
+        progressPercent: queuedJob.progressPercent,
+        stageMessage: 'Video render failed.',
+        errorMessage: errMsg,
+        nowIso: failedIso,
+      });
+
+      const freshCampaigns = readCampaigns();
+      const targetIdx = freshCampaigns.findIndex((c) => c.id === id);
+      if (targetIdx !== -1) {
+        const existingCamp = freshCampaigns[targetIdx];
+        const history = Array.isArray(existingCamp.renderHistory) ? existingCamp.renderHistory : [];
+        // Preserve all campaign, storyboard, and audio data when rendering fails
+        freshCampaigns[targetIdx] = {
+          ...existingCamp,
+          activeRenderJob: failedJob,
+          renderHistory: [failedJob, ...history.filter((j) => j.id !== failedJob.id)],
+          status: existingCamp.latestCompletedRender ? 'video_ready' : 'audio_ready',
+          updatedAt: failedIso,
+        };
+        writeCampaigns(freshCampaigns);
+      }
+
+      console.error('Error in POST /api/campaigns/:id/render:', errMsg);
+      res.status(500).json({
+        error: errMsg,
+        renderJob: failedJob,
+      });
+    }
+  });
+
+  // 10. MILESTONE 3: Poll Render Job Status & Approval Gate State
+  app.get('/api/campaigns/:id/render-status', (req: Request, res: Response) => {
+    const { id } = req.params;
+    if (!isSafeIdentifier(id)) {
+      res.status(400).json({ error: 'Invalid campaign ID.' });
+      return;
+    }
+
+    const campaigns = readCampaigns();
+    const campaign = campaigns.find((c) => c.id === id);
+    if (!campaign) {
+      res.status(404).json({ error: 'Campaign not found.' });
+      return;
+    }
+
+    res.json({
+      campaignId: campaign.id,
+      status: campaign.status,
+      activeRenderJob: campaign.activeRenderJob || null,
+      latestCompletedRender: campaign.latestCompletedRender || null,
+      renderHistory: campaign.renderHistory || [],
+      approval: campaign.approval || { status: 'unrendered' },
+    });
+  });
+
+  // 11. MILESTONE 3: Human Preview & Approval Gate (Approve or Reject Rendered Video)
+  app.post('/api/campaigns/:id/approval', (req: Request, res: Response) => {
+    const { id } = req.params;
+    if (!isSafeIdentifier(id)) {
+      res.status(400).json({ error: 'Invalid campaign ID.' });
+      return;
+    }
+
+    const campaigns = readCampaigns();
+    const index = campaigns.findIndex((c) => c.id === id);
+    if (index === -1) {
+      res.status(404).json({ error: 'Campaign not found.' });
+      return;
+    }
+
+    const { action, rejectionReason = '' } = req.body ?? {};
+    if (action !== 'approve' && action !== 'reject') {
+      res.status(400).json({ error: 'Invalid approval action. Expected "approve" or "reject".' });
+      return;
+    }
+
+    const decision = applyApprovalDecision(
+      campaigns[index],
+      action,
+      typeof rejectionReason === 'string' ? rejectionReason : ''
+    );
+
+    if (!decision.valid || !decision.campaign) {
+      res.status(400).json({ error: decision.error || 'Could not process approval decision.' });
+      return;
+    }
+
+    campaigns[index] = decision.campaign;
+    writeCampaigns(campaigns);
+
+    res.json({
+      campaign: decision.campaign,
+      approval: decision.campaign.approval,
+    });
+  });
+
+  // 12. Delete a Campaign
   app.delete('/api/campaigns/:id', (req: Request, res: Response) => {
     const { id } = req.params;
     const campaigns = readCampaigns();

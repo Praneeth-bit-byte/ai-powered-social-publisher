@@ -28,6 +28,8 @@ import {
   Mic,
   ShieldCheck,
   RotateCcw,
+  Video,
+  XCircle,
 } from 'lucide-react';
 import type {
   Campaign,
@@ -43,18 +45,23 @@ import {
   removeShotFromStoryboard,
 } from './utils/milestone2Validators.ts';
 import {
+  checkCampaignRenderReadiness,
+  computeCampaignContentFingerprint,
+} from './utils/milestone3Validators.ts';
+import {
   createBlankStudioState,
   resetToBlankProductState,
   applyPresetToStudioState,
   applyUploadedImageToStudioState,
   applyCampaignToStudioState,
   handleVoiceoverErrorState,
+  handleRenderErrorState,
   applyVoiceoverOrMusicUpdatePreservingEdits,
   analyzeUploadedImageWithGemini,
   type StudioSessionState,
 } from './utils/studioState.ts';
 
-type ActiveSection = 'workspace' | 'storyboard' | 'audio' | 'campaigns' | 'models';
+type ActiveSection = 'workspace' | 'storyboard' | 'audio' | 'render' | 'campaigns' | 'models';
 type ProfileTab = 'visual' | 'json';
 
 const BRAND_VOICE_OPTIONS = [
@@ -90,9 +97,9 @@ const MILESTONE_ROADMAP = [
   {
     number: '02',
     title: 'AI Script, Shot-by-Shot Storyboard & Voiceover/Music Synthesis',
-    status: 'Active · Ready for Testing',
+    status: 'Completed & Verified',
     active: true,
-    completed: false,
+    completed: true,
     summary:
       'Generate brand-safe cinematic 9:16 video concepts, 15–30s voiceover scripts, shot-by-shot storyboards with editable scenes/prompts, and real 24kHz WAV voiceovers using gemini-3.8-flash-lite-tts.',
     deliverables: [
@@ -104,16 +111,16 @@ const MILESTONE_ROADMAP = [
   },
   {
     number: '03',
-    title: '9:16 Video Ad Generation, Conversational Editing & Approval Gate',
-    status: 'Awaiting Milestone 2 Approval',
-    active: false,
+    title: '9:16 Video Ad Rendering, Motion Compositor & Approval Gate',
+    status: 'Active · Ready for Testing',
+    active: true,
     completed: false,
     summary:
-      'Render vertical 9:16 MP4 ads with synchronized voiceover, burned-in subtitles, and brand watermark. Support conversational revisions (v1, v2...) and enforce human approval before publishing.',
+      'Render genuine vertical 9:16 MP4 ads (1080×1920) combining the actual product image, storyboard shot cards, burned-in subtitles, 24kHz WAV voiceover, and optional background music with an explicit Preview & Approval Gate.',
     deliverables: [
-      'gemini-omni-1.1-flash image-to-video + FFmpeg 9:16 dynamic motion-canvas compositor',
-      'Version history timeline and conversational edit instruction loop',
-      'Explicit human approval gate and Web Speech API completion alert',
+      'Genuine 9:16 vertical H.264/AAC MP4 renderer (1080×1920) with product-preserving shot cards & subtitles',
+      'Transparent engine labeling (Gemini Omni 1.1 Flash probe + FFmpeg 9:16 Motion-Compositor fallback)',
+      'Playable 9:16 MP4 preview, Approve/Reject/Render Again gate, and automatic invalidation on edits',
     ],
   },
   {
@@ -832,12 +839,165 @@ export default function App() {
     }
   };
 
+  // MILESTONE 3 HANDLER: Render 9:16 Vertical MP4 Video
+  const handleRenderVideo = async () => {
+    const { activeCampaign, editableStoryboard, renderSettings } = studio;
+    if (!activeCampaign) return;
+
+    const readiness = checkCampaignRenderReadiness({
+      ...activeCampaign,
+      storyboard: editableStoryboard || activeCampaign.storyboard,
+    });
+    if (!readiness.ready) {
+      setStudio((prev) => ({
+        ...prev,
+        errorBanner:
+          readiness.missingSteps[0] ||
+          'Campaign requires a storyboard and synthesized voiceover WAV before rendering.',
+      }));
+      return;
+    }
+
+    setStudio((prev) => ({
+      ...prev,
+      isRenderingVideo: true,
+      lastRetryAction: null,
+      errorBanner: null,
+      warningBanner: null,
+      statusMessage: 'Starting 9:16 vertical MP4 render job...',
+    }));
+
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    try {
+      pollTimer = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`/api/campaigns/${activeCampaign.id}/render-status`);
+          if (!statusRes.ok) return;
+          const statusData = await statusRes.json();
+          if (statusData.activeRenderJob) {
+            setStudio((prev) =>
+              prev.activeCampaign
+                ? {
+                    ...prev,
+                    activeCampaign: {
+                      ...prev.activeCampaign,
+                      activeRenderJob: statusData.activeRenderJob,
+                    },
+                  }
+                : prev
+            );
+          }
+        } catch {
+          // Ignore transient poll errors while main render request is in flight
+        }
+      }, 650);
+
+      const res = await fetch(`/api/campaigns/${activeCampaign.id}/render`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          resolution: renderSettings.resolution,
+          includeSubtitles: renderSettings.includeSubtitles,
+          enginePreference: renderSettings.enginePreference,
+          revisionNote: renderSettings.revisionNote,
+          ...(editableStoryboard ? { storyboard: editableStoryboard } : {}),
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || '9:16 video rendering failed.');
+      }
+
+      const updated: Campaign = data.campaign;
+      setCampaigns((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+      setStudio((prev) => {
+        const nextState = applyCampaignToStudioState(updated);
+        nextState.renderSettings = {
+          ...prev.renderSettings,
+          revisionNote: '',
+        };
+        nextState.isRenderingVideo = false;
+        const job = updated.latestCompletedRender;
+        nextState.statusMessage = job
+          ? `Rendered 9:16 MP4 (${job.width}×${job.height}, ${job.durationSeconds}s, ${((job.byteLength || 0) / 1024).toFixed(1)} KB) via ${job.engineLabel}. Ready for review and approval.`
+          : 'Rendered 9:16 MP4 video.';
+        return nextState;
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : '9:16 video rendering failed.';
+      setStudio((prev) => handleRenderErrorState(prev, message));
+    } finally {
+      if (pollTimer) {
+        clearInterval(pollTimer);
+      }
+    }
+  };
+
+  // MILESTONE 3 HANDLER: Explicit Human Preview & Approval / Rejection Gate
+  const handleApprovalAction = async (
+    action: 'approve' | 'reject',
+    returnToStoryboardAfterReject = false
+  ) => {
+    const { activeCampaign, rejectionReasonDraft } = studio;
+    if (!activeCampaign) return;
+
+    setStudio((prev) => ({
+      ...prev,
+      isSubmittingApproval: true,
+      errorBanner: null,
+      warningBanner: null,
+      statusMessage: null,
+    }));
+
+    try {
+      const res = await fetch(`/api/campaigns/${activeCampaign.id}/approval`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action,
+          rejectionReason: rejectionReasonDraft,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || `Failed to ${action} rendered video.`);
+      }
+
+      const updated: Campaign = data.campaign;
+      setCampaigns((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+      setStudio((prev) => {
+        const nextState = applyCampaignToStudioState(updated);
+        nextState.renderSettings = prev.renderSettings;
+        nextState.isSubmittingApproval = false;
+        nextState.statusMessage =
+          action === 'approve'
+            ? `Approved 9:16 video v${updated.latestCompletedRender?.versionNumber || 1} at ${updated.approval?.reviewedAt}. Any subsequent campaign edits will invalidate this approval.`
+            : 'Video rejected. You can now adjust the storyboard, script, or voiceover and render again.';
+        return nextState;
+      });
+
+      if (action === 'reject' && returnToStoryboardAfterReject) {
+        setActiveSection('storyboard');
+      }
+    } catch (err: unknown) {
+      setStudio((prev) => ({
+        ...prev,
+        isSubmittingApproval: false,
+        errorBanner: err instanceof Error ? err.message : 'Failed to update approval status.',
+      }));
+    }
+  };
+
   const handleRetryLastAction = async () => {
     const action = studio.lastRetryAction;
     if (action === 'storyboard') {
       await handleGenerateStoryboard();
     } else if (action === 'voiceover') {
       await handleGenerateVoiceover();
+    } else if (action === 'render') {
+      await handleRenderVideo();
     } else if (action === 'analyze') {
       await runAnalyzeProductFlow();
     }
@@ -971,12 +1131,16 @@ export default function App() {
     voiceStylePrompt,
     voiceScriptDraft,
     musicPromptDraft,
+    renderSettings,
+    rejectionReasonDraft,
     isAnalyzing,
     isSavingProfile,
     isGeneratingStoryboard,
     isSavingStoryboard,
     isGeneratingVoiceover,
     isProcessingMusic,
+    isRenderingVideo,
+    isSubmittingApproval,
     hasUnsavedProfileEdits,
     hasUnsavedStoryboardEdits,
     lastRetryAction,
@@ -984,6 +1148,39 @@ export default function App() {
     errorBanner,
     statusMessage,
   } = studio;
+
+  const renderReadiness = activeCampaign
+    ? checkCampaignRenderReadiness({
+        ...activeCampaign,
+        storyboard: editableStoryboard || activeCampaign.storyboard,
+      })
+    : {
+        ready: false,
+        missingSteps: ['Select or analyze a product campaign first.'],
+        audioModeSummary: 'No campaign loaded',
+      };
+
+  const liveDraftFingerprint = activeCampaign
+    ? computeCampaignContentFingerprint(
+        {
+          title: form.title || activeCampaign.title,
+          price: form.price,
+          brandName: form.brandName || activeCampaign.brandName,
+          imageDataUrl: form.imageDataUrl || activeCampaign.imageDataUrl,
+          storyboard: editableStoryboard || activeCampaign.storyboard,
+          voiceover: activeCampaign.voiceover,
+          backgroundMusic: activeCampaign.backgroundMusic,
+        },
+        renderSettings
+      )
+    : '';
+
+  const isApprovalOutOfSyncWithDraft = Boolean(
+    activeCampaign?.approval?.status === 'approved' &&
+      activeCampaign.approval.contentFingerprintAtReview &&
+      liveDraftFingerprint &&
+      activeCampaign.approval.contentFingerprintAtReview !== liveDraftFingerprint
+  );
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
@@ -1038,25 +1235,25 @@ export default function App() {
           </button>
           <button
             type="button"
-            onClick={() => handleSwitchSection('campaigns')}
+            onClick={() => handleSwitchSection('render')}
             className={`py-1 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
-              activeSection === 'campaigns'
+              activeSection === 'render'
                 ? 'border-orange-600 text-slate-900 dark:text-white'
                 : 'border-transparent hover:text-slate-900 dark:hover:text-slate-200'
             }`}
           >
-            Saved Campaigns ({campaigns.length})
+            04. Render & Approval
           </button>
           <button
             type="button"
-            onClick={() => handleSwitchSection('models')}
+            onClick={() => handleSwitchSection('campaigns')}
             className={`py-1 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
-              activeSection === 'models'
+              activeSection === 'campaigns' || activeSection === 'models'
                 ? 'border-orange-600 text-slate-900 dark:text-white'
                 : 'border-transparent hover:text-slate-900 dark:hover:text-slate-200'
             }`}
           >
-            API & Milestones
+            Campaigns ({campaigns.length})
           </button>
         </nav>
 
@@ -1081,7 +1278,7 @@ export default function App() {
               <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-1.5">
                 <span>Production Pipeline</span>
                 <span aria-hidden="true">·</span>
-                <span className="font-mono tabular-nums">Milestone 2 of 6</span>
+                <span className="font-mono tabular-nums">Milestone 3 of 6</span>
               </div>
               <h2 className="font-display text-sm font-semibold text-slate-900 dark:text-slate-100">
                 10-Step Workflow Gate
@@ -1097,7 +1294,7 @@ export default function App() {
                   {activeCampaign.title}
                 </div>
                 <div className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Stage: {activeCampaign.status.replace('_', ' ')}
+                  Stage: {activeCampaign.status.replace(/_/g, ' ')}
                 </div>
               </div>
             ) : (
@@ -1139,7 +1336,7 @@ export default function App() {
                 >
                   <div className="flex items-center justify-between font-semibold">
                     <span>02. Script & 9:16 Storyboard</span>
-                    <span className="font-mono text-[11px] text-orange-600 dark:text-orange-400">ACTIVE</span>
+                    <span className="font-mono text-[11px] text-emerald-600 dark:text-emerald-400">M2</span>
                   </div>
                   <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                     Shot-by-shot 9:16 prompts & timing
@@ -1159,7 +1356,7 @@ export default function App() {
                 >
                   <div className="flex items-center justify-between font-semibold">
                     <span>03. Voiceover & Music Studio</span>
-                    <span className="font-mono text-[11px] text-orange-600 dark:text-orange-400">ACTIVE</span>
+                    <span className="font-mono text-[11px] text-emerald-600 dark:text-emerald-400">M2</span>
                   </div>
                   <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                     Real 24kHz WAV TTS & audio deck
@@ -1167,9 +1364,49 @@ export default function App() {
                 </button>
               </li>
 
+              <li>
+                <button
+                  type="button"
+                  onClick={() => handleSwitchSection('render')}
+                  className={`w-full text-left p-2.5 rounded-lg border transition-colors ${
+                    activeSection === 'render'
+                      ? 'bg-orange-600/10 border-orange-600/40 text-slate-900 dark:text-slate-100'
+                      : 'border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800/50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between font-semibold">
+                    <span>04. 9:16 Video Ad Render</span>
+                    <span className="font-mono text-[11px] text-orange-600 dark:text-orange-400">ACTIVE</span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                    1080×1920 H.264 MP4 + WAV mix
+                  </p>
+                </button>
+              </li>
+
+              <li>
+                <button
+                  type="button"
+                  onClick={() => handleSwitchSection('render')}
+                  className={`w-full text-left p-2.5 rounded-lg border transition-colors ${
+                    activeSection === 'render'
+                      ? 'bg-orange-600/10 border-orange-600/40 text-slate-900 dark:text-slate-100'
+                      : 'border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800/50'
+                  }`}
+                >
+                  <div className="flex items-center justify-between font-semibold">
+                    <span>05. Preview & Approval Gate</span>
+                    <span className="font-mono text-[11px] text-orange-600 dark:text-orange-400">
+                      {activeCampaign?.approval?.status === 'approved' ? 'APPROVED' : 'ACTIVE'}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                    Approve, Reject, or Render Again
+                  </p>
+                </button>
+              </li>
+
               {[
-                { step: '04. 9:16 Video Ad Render', milestone: 'M3' },
-                { step: '05. Preview & Approval Gate', milestone: 'M3' },
                 { step: '06. 90/100 SEO Caption Rubric', milestone: 'M4' },
                 { step: '07. Cloud Persistence & Auth', milestone: 'M5' },
                 { step: '08. Smart Audience Scheduler', milestone: 'M6' },
@@ -2621,13 +2858,25 @@ export default function App() {
                   </h1>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => handleSwitchSection('storyboard')}
-                  className="px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
-                >
-                  Back to Storyboard Editor
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleSwitchSection('storyboard')}
+                    className="px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+                  >
+                    Back to Storyboard Editor
+                  </button>
+                  {activeCampaign?.voiceover && (
+                    <button
+                      type="button"
+                      onClick={() => handleSwitchSection('render')}
+                      className="px-4 py-2 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      <span>Step 04: 9:16 Video Render & Approval</span>
+                      <ChevronRight className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
               </div>
 
               {!activeCampaign ? (
@@ -2991,6 +3240,27 @@ export default function App() {
                         </div>
                       )}
                     </div>
+
+                    {activeCampaign.voiceover && (
+                      <div className="p-4 rounded-xl border border-orange-600/30 bg-orange-600/5 flex items-center justify-between gap-4">
+                        <div className="text-xs">
+                          <div className="font-semibold text-slate-900 dark:text-slate-100">
+                            Ready for Milestone 3 Vertical Video Rendering
+                          </div>
+                          <div className="text-slate-600 dark:text-slate-400 mt-0.5">
+                            Combine your product image, {editableStoryboard?.shots.length || activeCampaign.storyboard?.shots.length || 0} storyboard shots, and 24kHz WAV voiceover into a 9:16 MP4.
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleSwitchSection('render')}
+                          className="px-4 py-2 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                        >
+                          <span>Go to 9:16 Render & Approval</span>
+                          <ChevronRight className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
@@ -2998,7 +3268,591 @@ export default function App() {
           )}
 
           {/* ===================================================================
-              SECTION 4: SAVED CAMPAIGNS
+              SECTION 4: MILESTONE 3 — 9:16 VIDEO RENDERING & PREVIEW/APPROVAL GATE
+             =================================================================== */}
+          {activeSection === 'render' && (
+            <div className="space-y-6">
+              <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 pb-5 border-b border-slate-200 dark:border-slate-800">
+                <div>
+                  <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400 mb-1.5">
+                    <span>Steps 04 & 05 · Milestone 3</span>
+                    <span aria-hidden="true">·</span>
+                    <span>Genuine 9:16 Vertical MP4 Renderer & Human Approval Gate</span>
+                  </div>
+                  <h1 className="font-display text-2xl lg:text-3xl font-bold tracking-tight text-slate-900 dark:text-slate-100">
+                    9:16 Video Rendering & Preview / Approval Gate
+                  </h1>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleSwitchSection('storyboard')}
+                    className="px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+                  >
+                    Back to Storyboard Editor
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSwitchSection('audio')}
+                    className="px-3.5 py-2 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap"
+                  >
+                    Back to Audio Studio
+                  </button>
+                </div>
+              </div>
+
+              {!activeCampaign ? (
+                <div className="p-12 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-center space-y-3">
+                  <Video className="w-9 h-9 mx-auto text-slate-400" />
+                  <h3 className="font-display text-base font-semibold">
+                    Select or Analyze a Product Campaign First
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+                    Video rendering and approval require an active product campaign with a 9:16 storyboard and synthesized voiceover WAV.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => handleSwitchSection('workspace')}
+                    className="px-4 py-2 rounded-lg bg-orange-600 text-white text-xs font-semibold"
+                  >
+                    Go to Step 01: Product Studio
+                  </button>
+                </div>
+              ) : !renderReadiness.ready ? (
+                <div className="p-8 rounded-xl border border-amber-300 dark:border-amber-900/70 bg-white dark:bg-slate-900 space-y-4">
+                  <div className="flex items-start gap-3">
+                    <Lock className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <h2 className="font-display text-base font-bold text-slate-900 dark:text-slate-100">
+                        Preview & Approval Gate Locked — Prerequisite Steps Needed
+                      </h2>
+                      <p className="text-xs text-slate-600 dark:text-slate-400">
+                        Complete the following prerequisite steps for <strong>{activeCampaign.title}</strong> before rendering the 9:16 vertical MP4:
+                      </p>
+                    </div>
+                  </div>
+                  <ul className="space-y-2 text-xs text-slate-700 dark:text-slate-300 pl-8 list-disc">
+                    {renderReadiness.missingSteps.map((req: string, i: number) => (
+                      <li key={i}>{req}</li>
+                    ))}
+                  </ul>
+                  <div className="flex flex-wrap items-center gap-3 pl-8 pt-2">
+                    {!editableStoryboard && !activeCampaign.storyboard && (
+                      <button
+                        type="button"
+                        onClick={() => handleSwitchSection('storyboard')}
+                        className="px-4 py-2 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-xs font-semibold"
+                      >
+                        Go to Step 02: Generate 9:16 Storyboard
+                      </button>
+                    )}
+                    {!activeCampaign.voiceover && (
+                      <button
+                        type="button"
+                        onClick={() => handleSwitchSection('audio')}
+                        className="px-4 py-2 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-xs font-semibold"
+                      >
+                        Go to Step 03: Synthesize 24kHz WAV Voiceover
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 xl:grid-cols-12 gap-8 items-start">
+                  {/* Left Column (5 cols): Render Settings, Job Controller & Render History */}
+                  <div className="xl:col-span-5 space-y-6">
+                    <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-5">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h2 className="font-display text-base font-bold text-slate-900 dark:text-slate-100">
+                            1. 9:16 Vertical Render Configuration
+                          </h2>
+                          <p className="text-xs text-slate-500 dark:text-slate-400">
+                            Configure output resolution, burned-in captions, and rendering engine.
+                          </p>
+                        </div>
+                        <span className="font-mono text-xs text-orange-600 dark:text-orange-400 shrink-0">
+                          9:16 MP4
+                        </span>
+                      </div>
+
+                      <div className="space-y-4">
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                            Target Vertical Resolution (9:16)
+                          </label>
+                          <select
+                            value={renderSettings.resolution}
+                            onChange={(e) =>
+                              setStudio((prev) => ({
+                                ...prev,
+                                renderSettings: {
+                                  ...prev.renderSettings,
+                                  resolution: e.target.value as '1080x1920' | '720x1280',
+                                },
+                              }))
+                            }
+                            className="w-full px-3 py-2 text-xs font-mono rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950"
+                          >
+                            <option value="1080x1920">1080 × 1920 (Full HD Vertical — Default)</option>
+                            <option value="720x1280">720 × 1280 (HD Vertical Fast Render)</option>
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                            Video Rendering Engine
+                          </label>
+                          <select
+                            value={renderSettings.enginePreference}
+                            onChange={(e) =>
+                              setStudio((prev) => ({
+                                ...prev,
+                                renderSettings: {
+                                  ...prev.renderSettings,
+                                  enginePreference: e.target.value as
+                                    | 'ffmpeg_motion_compositor'
+                                    | 'auto_omni_with_ffmpeg_fallback',
+                                },
+                              }))
+                            }
+                            className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950"
+                          >
+                            <option value="ffmpeg_motion_compositor">
+                              FFmpeg 9:16 Motion-Compositor (Verified Local H.264 Renderer)
+                            </option>
+                            <option value="auto_omni_with_ffmpeg_fallback">
+                              Attempt Gemini Omni 1.1 Flash (Paid Tier) + FFmpeg 9:16 Fallback
+                            </option>
+                          </select>
+                          <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
+                            The FFmpeg 9:16 Motion-Compositor renders your actual product image, storyboard shot cards, and burned-in captions synchronized to the 24kHz WAV voiceover. It is clearly labeled and never misrepresented as generative AI video.
+                          </p>
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60">
+                          <div>
+                            <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                              Burn-In Shot Subtitles & On-Screen Overlays
+                            </div>
+                            <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                              Renders editable spoken voiceover segments & shot overlays onto each 9:16 shot
+                            </div>
+                          </div>
+                          <input
+                            type="checkbox"
+                            checked={renderSettings.includeSubtitles}
+                            onChange={(e) =>
+                              setStudio((prev) => ({
+                                ...prev,
+                                renderSettings: {
+                                  ...prev.renderSettings,
+                                  includeSubtitles: e.target.checked,
+                                },
+                              }))
+                            }
+                            className="w-4 h-4 accent-orange-600 rounded cursor-pointer"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
+                            Render Revision Note (Optional)
+                          </label>
+                          <input
+                            type="text"
+                            value={renderSettings.revisionNote || ''}
+                            onChange={(e) =>
+                              setStudio((prev) => ({
+                                ...prev,
+                                renderSettings: {
+                                  ...prev.renderSettings,
+                                  revisionNote: e.target.value,
+                                },
+                              }))
+                            }
+                            placeholder="e.g., v2 with tighter 3s hook and Kore voiceover"
+                            className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Active Render Job Progress Indicator */}
+                      {(isRenderingVideo ||
+                        activeCampaign.activeRenderJob?.status === 'queued' ||
+                        activeCampaign.activeRenderJob?.status === 'processing') && (
+                        <div
+                          role="status"
+                          aria-live="polite"
+                          className="p-4 rounded-lg border border-orange-500/40 bg-orange-500/10 space-y-2.5"
+                        >
+                          <div className="flex items-center justify-between text-xs font-semibold text-slate-900 dark:text-slate-100">
+                            <span className="inline-flex items-center gap-2">
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin text-orange-600 dark:text-orange-400" />
+                              <span>
+                                {activeCampaign.activeRenderJob?.stageMessage ||
+                                  'Rendering 9:16 vertical MP4 shots & mixing audio...'}
+                              </span>
+                            </span>
+                            <span className="font-mono tabular-nums">
+                              {activeCampaign.activeRenderJob?.progressPercent || 25}%
+                            </span>
+                          </div>
+                          <div className="w-full h-2 rounded-full bg-slate-200 dark:bg-slate-800 overflow-hidden">
+                            <div
+                              className="h-full bg-orange-600 transition-all duration-300"
+                              style={{
+                                width: `${Math.max(
+                                  12,
+                                  activeCampaign.activeRenderJob?.progressPercent || 25
+                                )}%`,
+                              }}
+                            />
+                          </div>
+                        </div>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={handleRenderVideo}
+                        disabled={
+                          isRenderingVideo ||
+                          activeCampaign.activeRenderJob?.status === 'queued' ||
+                          activeCampaign.activeRenderJob?.status === 'processing'
+                        }
+                        className="w-full py-2.5 px-4 rounded-lg bg-orange-600 hover:bg-orange-500 disabled:opacity-60 text-white text-sm font-semibold transition-colors inline-flex items-center justify-center gap-2 whitespace-nowrap"
+                      >
+                        {isRenderingVideo ? (
+                          <>
+                            <RefreshCw className="w-4 h-4 animate-spin" />
+                            <span>Rendering 9:16 Vertical MP4...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Video className="w-4 h-4" />
+                            <span>
+                              {activeCampaign.latestCompletedRender
+                                ? 'Render Again (New 9:16 MP4 Version)'
+                                : 'Render 9:16 Vertical Video (.MP4)'}
+                            </span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    {/* Render Version History */}
+                    {activeCampaign.renderHistory && activeCampaign.renderHistory.length > 0 && (
+                      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-3">
+                        <h3 className="font-display text-sm font-bold text-slate-900 dark:text-slate-100">
+                          Rendered Version History ({activeCampaign.renderHistory.length})
+                        </h3>
+                        <div className="space-y-2 max-h-60 overflow-y-auto">
+                          {activeCampaign.renderHistory.map((job) => (
+                            <div
+                              key={job.id}
+                              className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/50 flex items-center justify-between gap-3 text-xs"
+                            >
+                              <div className="min-w-0 space-y-0.5">
+                                <div className="font-semibold text-slate-900 dark:text-slate-100 truncate">
+                                  v{job.versionNumber} · {job.resolution} · {job.durationSeconds}s
+                                </div>
+                                <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                                  {job.engineLabel}
+                                </div>
+                                {job.revisionNote && (
+                                  <div className="text-[11px] text-slate-600 dark:text-slate-300 truncate">
+                                    Note: {job.revisionNote}
+                                  </div>
+                                )}
+                              </div>
+                              {job.videoFileUrl && (
+                                <a
+                                  href={job.videoFileUrl}
+                                  download={`${activeCampaign.id}-v${job.versionNumber}-9x16.mp4`}
+                                  className="px-2.5 py-1 rounded border border-slate-300 dark:border-slate-700 text-[11px] font-semibold shrink-0 hover:bg-slate-100 dark:hover:bg-slate-800"
+                                >
+                                  .MP4
+                                </a>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Right Column (7 cols): 9:16 Vertical Video Player & Human Approval Gate */}
+                  <div className="xl:col-span-7 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-6">
+                    {!activeCampaign.latestCompletedRender ? (
+                      <div className="py-16 text-center space-y-3">
+                        <Film className="w-10 h-10 mx-auto text-slate-400" />
+                        <h3 className="font-display text-lg font-semibold text-slate-900 dark:text-slate-100">
+                          Ready to Render 9:16 Vertical Video
+                        </h3>
+                        <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto leading-relaxed">
+                          Click <strong>Render 9:16 Vertical Video (.MP4)</strong> on the left to composite{' '}
+                          <strong>
+                            {(editableStoryboard || activeCampaign.storyboard)?.shots.length || 0} shots
+                          </strong>{' '}
+                          at <strong>{renderSettings.resolution}</strong> with your synthesized{' '}
+                          <strong>{activeCampaign.voiceover?.voiceName}</strong> 24kHz WAV voiceover.
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        {/* Header & Download MP4 Bar */}
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200 dark:border-slate-800">
+                          <div>
+                            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                              <span className="font-mono font-semibold text-orange-600 dark:text-orange-400">
+                                VERSION v{activeCampaign.latestCompletedRender.versionNumber}
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono tabular-nums">
+                                {activeCampaign.latestCompletedRender.width}×
+                                {activeCampaign.latestCompletedRender.height} (9:16)
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono tabular-nums">
+                                {activeCampaign.latestCompletedRender.durationSeconds}s
+                              </span>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono tabular-nums">
+                                {(
+                                  (activeCampaign.latestCompletedRender.byteLength || 0) / 1024
+                                ).toFixed(1)}{' '}
+                                KB
+                              </span>
+                            </div>
+                            <h2 className="font-display text-lg font-bold text-slate-900 dark:text-slate-100 mt-1">
+                              {activeCampaign.title} — {editableStoryboard?.targetPlatformFormat || activeCampaign.storyboard?.targetPlatformFormat}
+                            </h2>
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              onClick={handleRenderVideo}
+                              disabled={isRenderingVideo}
+                              className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                              <span>Render Again</span>
+                            </button>
+                            {activeCampaign.latestCompletedRender.videoFileUrl && (
+                              <a
+                                href={activeCampaign.latestCompletedRender.videoFileUrl}
+                                download={`${activeCampaign.id}-v${activeCampaign.latestCompletedRender.versionNumber}-9x16.mp4`}
+                                className="px-3.5 py-1.5 rounded-lg bg-slate-900 dark:bg-white text-white dark:text-slate-900 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                <span>Download .MP4</span>
+                              </a>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Approval Status Banner */}
+                        {(activeCampaign.approval?.status === 'invalidated' ||
+                          isApprovalOutOfSyncWithDraft) && (
+                          <div className="p-4 rounded-lg border border-amber-400 dark:border-amber-800 bg-amber-50/90 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 text-xs space-y-1">
+                            <div className="font-bold flex items-center gap-1.5">
+                              <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0" />
+                              <span>Approval Invalidated After Campaign Edits</span>
+                            </div>
+                            <p>
+                              {activeCampaign.approval?.invalidationReason ||
+                                'Campaign metadata, storyboard, audio, or render settings were modified after approval. Please render a fresh 9:16 MP4 and approve again.'}
+                            </p>
+                          </div>
+                        )}
+
+                        {activeCampaign.approval?.status === 'approved' &&
+                          !isApprovalOutOfSyncWithDraft && (
+                            <div className="p-4 rounded-lg border border-emerald-400 dark:border-emerald-800 bg-emerald-50/90 dark:bg-emerald-950/40 text-emerald-900 dark:text-emerald-200 text-xs space-y-1">
+                              <div className="font-bold flex items-center gap-1.5">
+                                <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                                <span>
+                                  Approved for Publishing · Version v
+                                  {activeCampaign.latestCompletedRender.versionNumber}
+                                </span>
+                              </div>
+                              <p>
+                                Approved at{' '}
+                                <span className="font-mono">
+                                  {activeCampaign.approval.reviewedAt}
+                                </span>
+                                . Any subsequent edits to product profile, storyboard, script, voiceover, music, or render settings will automatically invalidate this approval.
+                              </p>
+                            </div>
+                          )}
+
+                        {activeCampaign.approval?.status === 'rejected' && (
+                          <div className="p-4 rounded-lg border border-red-300 dark:border-red-900/70 bg-red-50/90 dark:bg-red-950/40 text-red-900 dark:text-red-200 text-xs space-y-2">
+                            <div className="font-bold flex items-center gap-1.5">
+                              <XCircle className="w-4 h-4 text-red-600 dark:text-red-400 shrink-0" />
+                              <span>Video Rejected in Preview Gate</span>
+                            </div>
+                            <p>
+                              Reason: {activeCampaign.approval.rejectionReason} (Rejected at{' '}
+                              <span className="font-mono">{activeCampaign.approval.reviewedAt}</span>)
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => handleSwitchSection('storyboard')}
+                              className="px-3 py-1.5 rounded-md bg-red-600 text-white font-semibold inline-flex items-center gap-1.5"
+                            >
+                              <span>Return to Storyboard Editor to Make Changes</span>
+                              <ChevronRight className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        )}
+
+                        {/* 9:16 Video Player + Metadata Inspection Grid */}
+                        <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
+                          <div className="md:col-span-6 flex justify-center">
+                            <div className="w-full max-w-[290px] aspect-[9/16] rounded-xl overflow-hidden border-2 border-slate-800 bg-slate-950 shadow-lg">
+                              <video
+                                key={activeCampaign.latestCompletedRender.videoFileUrl}
+                                controls
+                                playsInline
+                                preload="metadata"
+                                src={activeCampaign.latestCompletedRender.videoFileUrl}
+                                className="w-full h-full object-contain bg-black"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="md:col-span-6 space-y-4">
+                            <div className="p-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 space-y-2.5 text-xs">
+                              <h3 className="font-display font-bold text-slate-900 dark:text-slate-100">
+                                Render & Media Verification Summary
+                              </h3>
+                              <div className="space-y-1.5 text-slate-600 dark:text-slate-400">
+                                <div>
+                                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                    Campaign:{' '}
+                                  </span>
+                                  <span>{activeCampaign.title}</span>
+                                </div>
+                                <div>
+                                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                    Platform:{' '}
+                                  </span>
+                                  <span>
+                                    {editableStoryboard?.targetPlatformFormat ||
+                                      activeCampaign.storyboard?.targetPlatformFormat}
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                    Resolution & Codec:{' '}
+                                  </span>
+                                  <span className="font-mono">
+                                    {activeCampaign.latestCompletedRender.width}×
+                                    {activeCampaign.latestCompletedRender.height} · H.264 / AAC
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                    Duration (Rendered / Target):{' '}
+                                  </span>
+                                  <span className="font-mono tabular-nums">
+                                    {activeCampaign.latestCompletedRender.durationSeconds}s /{' '}
+                                    {activeCampaign.latestCompletedRender.targetDurationSeconds}s
+                                  </span>
+                                </div>
+                                <div>
+                                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                    Engine Used:{' '}
+                                  </span>
+                                  <span>{activeCampaign.latestCompletedRender.engineLabel}</span>
+                                </div>
+                                <div>
+                                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                    Audio Mix:{' '}
+                                  </span>
+                                  <span>{activeCampaign.latestCompletedRender.audioModeSummary}</span>
+                                </div>
+                                <div>
+                                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                    Subtitles:{' '}
+                                  </span>
+                                  <span>
+                                    {activeCampaign.latestCompletedRender.includeSubtitles
+                                      ? 'Burned-In 9:16 Captions Enabled'
+                                      : 'Disabled'}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+
+                            {/* Human Approval Gate Controls */}
+                            <div className="p-4 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 space-y-3">
+                              <h3 className="font-display text-sm font-bold text-slate-900 dark:text-slate-100">
+                                2. Explicit Human Approval Gate
+                              </h3>
+                              <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+                                Review the rendered 9:16 MP4 above. Approve to lock this version for Milestone 4+, or reject to return to the storyboard editor.
+                              </p>
+
+                              <button
+                                type="button"
+                                onClick={() => handleApprovalAction('approve')}
+                                disabled={isSubmittingApproval || isRenderingVideo}
+                                className="w-full py-2.5 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white text-xs font-semibold transition-colors inline-flex items-center justify-center gap-2"
+                              >
+                                <CheckCircle2 className="w-4 h-4" />
+                                <span>
+                                  {activeCampaign.approval?.status === 'approved' &&
+                                  !isApprovalOutOfSyncWithDraft
+                                    ? 'Re-Confirm Approval'
+                                    : 'Approve 9:16 Video for Publishing'}
+                                </span>
+                              </button>
+
+                              <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-2">
+                                <label className="block text-[11px] font-medium text-slate-600 dark:text-slate-400">
+                                  Rejection / Revision Feedback (Optional)
+                                </label>
+                                <input
+                                  type="text"
+                                  value={rejectionReasonDraft}
+                                  onChange={(e) =>
+                                    setStudio((prev) => ({
+                                      ...prev,
+                                      rejectionReasonDraft: e.target.value,
+                                    }))
+                                  }
+                                  placeholder="e.g., Adjust Shot 2 subtitle timing and hook phrasing"
+                                  className="w-full px-3 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950"
+                                />
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleApprovalAction('reject', true)}
+                                    disabled={isSubmittingApproval || isRenderingVideo}
+                                    className="flex-1 py-2 px-3 rounded-lg border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap"
+                                  >
+                                    <XCircle className="w-3.5 h-3.5" />
+                                    <span>Reject & Edit Storyboard</span>
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ===================================================================
+              SECTION 5: SAVED CAMPAIGNS
              =================================================================== */}
           {activeSection === 'campaigns' && (
             <div className="space-y-6">
@@ -3057,7 +3911,7 @@ export default function App() {
                           <span aria-hidden="true">·</span>
                           <span className="font-mono tabular-nums">{camp.price}</span>
                           <span aria-hidden="true">·</span>
-                          <span>{camp.status.replace('_', ' ')}</span>
+                          <span>{camp.status.replace(/_/g, ' ')}</span>
                         </div>
                         <h3 className="font-display text-base font-semibold text-slate-900 dark:text-slate-100">
                           {camp.title}
@@ -3067,12 +3921,15 @@ export default function App() {
                         </p>
                         <div className="text-[11px] text-slate-500 dark:text-slate-400">
                           Storyboard: {camp.storyboard ? `${camp.storyboard.shots.length} shots` : 'None'} · Voiceover:{' '}
-                          {camp.voiceover ? `${camp.voiceover.voiceName} (.wav)` : 'None'}
+                          {camp.voiceover ? `${camp.voiceover.voiceName} (.wav)` : 'None'} · Video:{' '}
+                          {camp.latestCompletedRender
+                            ? `v${camp.latestCompletedRender.versionNumber} (${camp.approval?.status || 'pending'})`
+                            : 'None'}
                         </div>
                       </div>
 
                       <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <button
                             type="button"
                             onClick={() => handleOpenSavedCampaign(camp, 'workspace')}
@@ -3093,6 +3950,13 @@ export default function App() {
                             className="px-2.5 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 text-xs font-semibold whitespace-nowrap"
                           >
                             Audio
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleOpenSavedCampaign(camp, 'render')}
+                            className="px-2.5 py-1.5 rounded-lg border border-orange-500/50 text-orange-600 dark:text-orange-400 text-xs font-semibold whitespace-nowrap"
+                          >
+                            Render
                           </button>
                         </div>
                         <button
